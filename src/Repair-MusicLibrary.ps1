@@ -8,13 +8,14 @@ param(
     [switch]$ApplyApproved,
     [switch]$BackupOriginals,
     [switch]$Yes,
-    [switch]$SkipSourceDecodeAudit
+    [switch]$SkipSourceDecodeAudit,
+    [switch]$AuditOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.6"
+$ToolVersion = "0.7-dev.2"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -92,6 +93,135 @@ function Test-SourceAudioDecode {
         ExitCode  = $exit
         ErrorText = ($output -join " | ")
     }
+}
+
+
+function Sync-ReplacementQueue {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IEnumerable]$Tracks,
+        [Parameter(Mandatory)]
+        [hashtable]$State
+    )
+
+    if (-not $State.ContainsKey("replacements") -or $null -eq $State.replacements) {
+        $State.replacements = @{}
+    }
+
+    if ($SkipSourceDecodeAudit) {
+        return
+    }
+
+    $now = (Get-Date).ToString("o")
+    $activeFailures = @(
+        $Tracks |
+        Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" }
+    )
+
+    $activePaths = @{}
+    foreach ($track in $activeFailures) {
+        $activePaths[$track.Path] = $true
+
+        if ($State.replacements.ContainsKey($track.Path)) {
+            $item = $State.replacements[$track.Path]
+
+            # Keep first-detected history and any future workflow fields already
+            # present in state, while refreshing the current audit evidence.
+            $item.AlbumDirectory = $track.Directory
+            $item.FileName = $track.FileName
+            $item.Artist = $track.Artist
+            $item.Album = $track.Album
+            $item.Date = $track.Date
+            $item.Disc = $track.Disc
+            $item.Track = $track.Track
+            $item.Title = $track.Title
+            $item.DecodeExitCode = $track.SourceDecodeExitCode
+            $item.DecodeError = $track.SourceDecodeError
+            $item.LastDetectedAt = $now
+
+            if (-not $item.ContainsKey("FirstDetectedAt") -or -not $item.FirstDetectedAt) {
+                $item.FirstDetectedAt = $now
+            }
+
+            # A file that is failing again must be actionable even if a prior
+            # run had marked the queue item otherwise.
+            if (-not $item.ContainsKey("Status") -or
+                [string]::IsNullOrWhiteSpace([string]$item.Status) -or
+                $item.Status -eq "NoLongerFailing") {
+                $item.Status = "Needed"
+            }
+        }
+        else {
+            $State.replacements[$track.Path] = @{
+                SourcePath       = $track.Path
+                AlbumDirectory   = $track.Directory
+                FileName         = $track.FileName
+                Artist           = $track.Artist
+                Album            = $track.Album
+                Date             = $track.Date
+                Disc             = $track.Disc
+                Track            = $track.Track
+                Title            = $track.Title
+                DecodeExitCode   = $track.SourceDecodeExitCode
+                DecodeError      = $track.SourceDecodeError
+                Status           = "Needed"
+                CandidatePath    = $null
+                CandidateStatus  = $null
+                FirstDetectedAt  = $now
+                LastDetectedAt   = $now
+                ResolvedAt       = $null
+            }
+        }
+    }
+
+    # Preserve queue history. If an item previously failed but no longer does,
+    # do not delete it; mark that fact for later replacement-workflow logic.
+    foreach ($key in @($State.replacements.Keys)) {
+        $item = $State.replacements[$key]
+        if ($item.SourcePath -and
+            $item.SourcePath.StartsWith($Root, [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not $activePaths.ContainsKey($item.SourcePath) -and
+            $item.Status -eq "Needed") {
+            $item.Status = "NoLongerFailing"
+        }
+    }
+}
+
+function Export-ReplacementQueue {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$State,
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $rows = @(
+        foreach ($item in $State.replacements.Values) {
+            [pscustomobject]@{
+                Status          = $item.Status
+                SourcePath      = $item.SourcePath
+                AlbumDirectory  = $item.AlbumDirectory
+                Artist          = $item.Artist
+                Album           = $item.Album
+                Date            = $item.Date
+                Disc            = $item.Disc
+                Track           = $item.Track
+                Title           = $item.Title
+                FileName        = $item.FileName
+                DecodeExitCode  = $item.DecodeExitCode
+                DecodeError     = $item.DecodeError
+                CandidatePath   = $item.CandidatePath
+                CandidateStatus = $item.CandidateStatus
+                FirstDetectedAt = $item.FirstDetectedAt
+                LastDetectedAt  = $item.LastDetectedAt
+                ResolvedAt      = $item.ResolvedAt
+            }
+        }
+    )
+
+    $rows |
+        Sort-Object AlbumDirectory, Disc, Track, FileName |
+        Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
 }
 
 function Get-FFProbeInfo {
@@ -1209,16 +1339,37 @@ function Invoke-ApprovedApply {
 if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw "Root directory does not exist: $Root" }
 if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) { throw "ffprobe was not found in PATH." }
 
+if ($AuditOnly -and $ApplyApproved) {
+    throw "-AuditOnly and -ApplyApproved cannot be used together."
+}
+
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
+
+# Audit-only output is intentionally isolated from persistent repair state.
+# This prevents a whole-library audit from overwriting an in-progress album
+# review stored in $StateRoot\state.json.
+$ReportRoot = if ($AuditOnly) { Join-Path $StateRoot "audit" } else { $StateRoot }
+New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
+
 $StateFile = Join-Path $StateRoot "state.json"
-$TrackReport = Join-Path $StateRoot "tracks.csv"
-$AlbumReport = Join-Path $StateRoot "albums.csv"
-$PlanReport = Join-Path $StateRoot "rename-plan.csv"
+$TrackReport = Join-Path $ReportRoot "tracks.csv"
+$AlbumReport = Join-Path $ReportRoot "albums.csv"
+$PlanReport = Join-Path $ReportRoot "rename-plan.csv"
+$ReplacementReport = Join-Path $ReportRoot "replacement-needed.csv"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
-Write-Host ("Mode : " + $(if ($ApplyApproved) { "APPLY APPROVED" } else { "READ-ONLY discovery/review" }))
+$modeName = if ($ApplyApproved) {
+    "APPLY APPROVED"
+}
+elseif ($AuditOnly) {
+    "AUDIT ONLY"
+}
+else {
+    "READ-ONLY discovery/review"
+}
+Write-Host "Mode : $modeName"
 Write-Host ""
 
 $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
@@ -1290,7 +1441,7 @@ else {
 }
 
 $tracks | Export-Csv -LiteralPath $TrackReport -NoTypeInformation -Encoding UTF8
-$DecodeReport = Join-Path $StateRoot "source-decode-audit.csv"
+$DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
 $tracks |
     Select-Object Path,Directory,FileName,SourceDecodeStatus,SourceDecodeExitCode,SourceDecodeError |
     Export-Csv -LiteralPath $DecodeReport -NoTypeInformation -Encoding UTF8
@@ -1389,7 +1540,72 @@ foreach ($g in $groups) {
 $albums | Export-Csv -LiteralPath $AlbumReport -NoTypeInformation -Encoding UTF8
 $plans | Export-Csv -LiteralPath $PlanReport -NoTypeInformation -Encoding UTF8
 
-$state = @{ version=$ToolVersion; root=$Root; reviewed=@{}; plans=@{}; applied=@{}; generatedAt=(Get-Date).ToString("o") }
+if ($AuditOnly) {
+    $auditReplacementRows = @(
+        $tracks |
+        Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" } |
+        ForEach-Object {
+            [pscustomobject]@{
+                Status          = "Needed"
+                SourcePath      = $_.Path
+                AlbumDirectory  = $_.Directory
+                Artist          = $_.Artist
+                Album           = $_.Album
+                Date            = $_.Date
+                Disc            = $_.Disc
+                Track           = $_.Track
+                Title           = $_.Title
+                FileName        = $_.FileName
+                DecodeExitCode  = $_.SourceDecodeExitCode
+                DecodeError     = $_.SourceDecodeError
+            }
+        }
+    )
+
+    $auditReplacementRows |
+        Sort-Object AlbumDirectory, Disc, Track, FileName |
+        Export-Csv -LiteralPath $ReplacementReport -NoTypeInformation -Encoding UTF8
+
+    $readyCount = @($albums | Where-Object { $_.Status -eq "READY" }).Count
+    $reviewCount = @($albums | Where-Object { $_.Status -eq "NEEDS REVIEW" }).Count
+    $incompleteCount = @($albums | Where-Object { $_.Status -eq "INCOMPLETE" }).Count
+    $sourceErrorCount = @($albums | Where-Object { $_.Status -eq "SOURCE ERROR" }).Count
+    $probeErrorTrackCount = @($tracks | Where-Object { $_.ProbeError }).Count
+    $suspiciousTitleCount = @($tracks | Where-Object { $_.SuspiciousTitle }).Count
+    $missingEmbeddedCount = @($tracks | Where-Object { -not $_.EmbeddedCover }).Count
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " AUDIT COMPLETE"
+    Write-Host ("=" * 72)
+    Write-Host "Audio files          : $($tracks.Count)"
+    Write-Host "Album folders        : $($albums.Count)"
+    Write-Host "READY                : $readyCount"
+    Write-Host "NEEDS REVIEW         : $reviewCount"
+    Write-Host "INCOMPLETE           : $incompleteCount"
+    Write-Host "SOURCE ERROR         : $sourceErrorCount"
+    Write-Host "ffprobe error tracks : $probeErrorTrackCount"
+    if ($SkipSourceDecodeAudit) {
+        Write-Host "Source decode errors : NOT CHECKED"
+    }
+    else {
+        Write-Host "Source decode errors : $sourceDecodeFailures"
+    }
+    Write-Host "Suspicious titles    : $suspiciousTitleCount"
+    Write-Host "Missing embedded art : $missingEmbeddedCount"
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $TrackReport"
+    Write-Host "  $AlbumReport"
+    Write-Host "  $PlanReport"
+    Write-Host "  $DecodeReport"
+    Write-Host "  $ReplacementReport"
+    Write-Host ""
+    Write-Host "Persistent repair state was NOT modified."
+    return
+}
+
+$state = @{ version=$ToolVersion; root=$Root; reviewed=@{}; plans=@{}; applied=@{}; replacements=@{}; generatedAt=(Get-Date).ToString("o") }
 
 # Apply mode must always load the saved review/plan state.
 # -Resume remains useful for returning to an interrupted interactive review.
@@ -1400,12 +1616,28 @@ if ($shouldLoadState -and (Test-Path -LiteralPath $StateFile)) {
         if ($old.root -eq $Root -and $old.reviewed) { $state.reviewed = $old.reviewed }
         if ($old.root -eq $Root -and $old.plans) { $state.plans = $old.plans }
         if ($old.root -eq $Root -and $old.ContainsKey("applied") -and $old.applied) { $state.applied = $old.applied }
+        if ($old.root -eq $Root -and $old.ContainsKey("replacements") -and $old.replacements) { $state.replacements = $old.replacements }
     } catch {
         Write-Warning "Could not load previous state."
     }
 }
 
+Sync-ReplacementQueue -Tracks $tracks -State $state
+Export-ReplacementQueue -State $state -Path $ReplacementReport
+$state.generatedAt=(Get-Date).ToString("o")
+$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StateFile -Encoding UTF8
+
+$replacementNeededCount = @(
+    $state.replacements.Values |
+    Where-Object { $_.Status -eq "Needed" }
+).Count
+
 if ($ApplyApproved) {
+    if (-not $SkipSourceDecodeAudit -and $replacementNeededCount -gt 0) {
+        Write-Host "Replacement queue   : $replacementNeededCount needed"
+        Write-Host "Replacement report  : $ReplacementReport"
+        Write-Host ""
+    }
     Invoke-ApprovedApply -BackupOriginals:$BackupOriginals -Yes:$Yes
     return
 }
@@ -1417,6 +1649,10 @@ Write-Host "  $TrackReport"
 Write-Host "  $AlbumReport"
 Write-Host "  $PlanReport"
 Write-Host "  $DecodeReport"
+Write-Host "  $ReplacementReport"
+if (-not $SkipSourceDecodeAudit) {
+    Write-Host "Replacement queue   : $replacementNeededCount needed"
+}
 Write-Host ""
 
 for ($a=0; $a -lt $albums.Count; $a++) {
@@ -1559,14 +1795,14 @@ for ($a=0; $a -lt $albums.Count; $a++) {
         if ($choice -eq "N") { break }
         if ($choice -eq "Q") {
             $state.generatedAt=(Get-Date).ToString("o")
-            $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $StateFile -Encoding UTF8
+            $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StateFile -Encoding UTF8
             Write-Host "State saved: $StateFile"
             return
         }
     }
 
     $state.generatedAt=(Get-Date).ToString("o")
-    $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $StateFile -Encoding UTF8
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StateFile -Encoding UTF8
 }
 
 Write-Host ""

@@ -1,17 +1,8 @@
 # Music Library Repair
 
-<p align="center">
-  <img src="assets/Music-Library-Repair-logo.png" alt="Music Library Repair logo" width="220">
-</p>
-
-<p align="center">
-  <strong>Typezer∅ Music Library Repair</strong><br>
-  Safe, transactional music-library repair and normalization toolkit for Windows.
-</p>
-
 **Typezer∅ Music Library Repair** is a safety-first Windows/PowerShell toolkit for auditing, normalizing, repairing, and verifying music libraries without re-encoding healthy audio.
 
-> Current development baseline: **v0.6**
+> Current development baseline: **v0.7-dev.2**
 
 The project grew out of real-world cleanup work against large, inconsistent music libraries. Its core rule is simple:
 
@@ -98,6 +89,16 @@ Resume an existing review:
     -Resume
 ```
 
+Run a non-interactive, read-only whole-library audit:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -AuditOnly
+```
+
+`-AuditOnly` writes reports under `$HOME\Downloads\Music-Library-Repair\audit` and deliberately does **not** modify persistent repair/review state.
+
 Apply only albums explicitly marked reviewed/approved:
 
 ```powershell
@@ -124,6 +125,7 @@ Typical runtime output includes:
 - `rename-plan.csv`
 - `source-decode-audit.csv`
 - `apply-report.csv`
+- `replacement-needed.csv`
 - `state.json`
 - `cover-cache\`
 - `Backups\`
@@ -165,7 +167,9 @@ v0.6 has been exercised successfully against real multi-album collections, inclu
 - exact MusicBrainz + Cover Art Archive resolution
 - post-write strict verification
 
-The next major development target is a first-class **bad-source replacement queue/workflow**.
+v0.7 development has started the first-class **bad-source replacement workflow**.
+
+The first slice is now implemented: strict source decode failures are persisted in `state.json` and exported to `replacement-needed.csv` so damaged files cannot disappear from the work queue between runs. Candidate selection and transactional replacement are the next steps.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 

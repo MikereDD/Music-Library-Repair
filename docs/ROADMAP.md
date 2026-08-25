@@ -2,10 +2,15 @@
 
 ## v0.7 target — Source Replacement
 
-Priority:
+Implemented in `v0.7-dev.1`:
 
 - export `replacement-needed.csv`
-- persistent replacement status in state
+- persistent replacement items/status in state
+- first/last detection timestamps
+- queue history preservation across rescans
+
+Next:
+
 - interactive replacement-candidate selection
 - strict candidate decode
 - duration/identity checks
@@ -15,6 +20,7 @@ Priority:
 
 ## Near-term
 
+- [x] non-interactive `-AuditOnly` whole-library reporting mode
 - missing-track / track-number gap detector
 - disc-aware gap detection
 - authoritative MusicBrainz tracklist comparison

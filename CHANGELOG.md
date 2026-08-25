@@ -6,6 +6,16 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 
 ## [Unreleased]
 
+### Added
+- Real `-AuditOnly` mode for non-interactive, read-only library-wide auditing
+- Audit reports isolated under `Music-Library-Repair\audit` so an audit cannot overwrite an in-progress repair `state.json`
+- Audit summary counts for album status, probe errors, strict decode failures, suspicious titles, and missing embedded artwork
+- Persistent source-replacement queue stored in `state.json`
+- `replacement-needed.csv` export for strict source decode failures
+- First/last detection timestamps for replacement items
+- Queue history is preserved when a previously failing path no longer fails
+- Existing future replacement fields are preserved across rescans
+
 ### Planned
 - Replacement queue for known-bad source audio
 - Verified replacement staging and transactional swap
