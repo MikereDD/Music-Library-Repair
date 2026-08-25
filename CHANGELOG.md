@@ -1,0 +1,124 @@
+# Changelog
+
+All notable changes to Music Library Repair are tracked here.
+
+The project is still pre-1.0. Behavior and state formats may evolve while the safety model is hardened.
+
+## [Unreleased]
+
+### Planned
+- Replacement queue for known-bad source audio
+- Verified replacement staging and transactional swap
+- Missing-track / track-gap detection
+- MusicBrainz media breakdown instead of raw aggregate track count
+- Better title verification against authoritative tracklists
+- Better Cover Art Archive candidate retry flow
+- Locked/in-use file preflight
+- Already-applied/no-op detection
+- FLAC and M4A apply support
+- Metadata diff view
+- Playlist handling
+- Broader automated tests
+
+## [0.6] - 2026-08-24
+
+### Added
+- First-class album artwork resolver
+- Embedded artwork recovery
+- MusicBrainz release search
+- Exact-release Cover Art Archive lookup
+- Cover cache and provenance
+- `CoverReleaseId`
+- `CoverSource`
+- Explicit continue-without-cover state
+- Cover validation/conversion to JPEG
+- Persistent title overrides
+- Interactive track-title review
+
+### Safety
+- Albums with source decode errors remain ineligible for approval/apply
+- Apply verifies the rewritten output before completing replacement
+- Missing cover must be resolved or explicitly acknowledged
+
+### Validated
+- Exact-release artwork lookup
+- Embedded artwork recovery
+- Clean partial apply when other albums in the same root contain bad source files
+- 2-CD canonical naming
+
+## [0.5]
+
+### Added
+- Exact bad-source filenames in review output
+- Suspicious-title detection for likely 30-character ID3v1 truncation
+- Interactive per-track title correction
+- External artwork path support
+
+## [0.4]
+
+### Added
+- Strict source decode pre-audit before review/apply
+- `SOURCE ERROR` album status
+- `source-decode-audit.csv`
+- Approval blocking when source audio is damaged
+- `-SkipSourceDecodeAudit` diagnostic override
+
+### Changed
+- Strict decode uses both FFmpeg error output and:
+  - `-xerror`
+  - `-err_detect explode`
+
+## [0.3.2]
+
+### Fixed
+- Post-write verification no longer trusts FFmpeg exit code alone.
+- Decoder error text now causes verification failure.
+
+## [0.3.1]
+
+### Fixed
+- Apply mode automatically loads saved state.
+
+## [0.3]
+
+### Added
+- First transactional MP3 apply path
+- Stream-copy metadata/artwork rewrite
+- Backup-original support
+- Canonical `cover.jpg`
+- Temporary build and verification before source replacement
+- Apply report
+- Rollback attempts on failure
+
+## [0.2]
+
+### Added
+- Persistent interactive per-album planning
+- Metadata editing
+- Cover selection
+- Plan preview
+- Approval/review state
+
+### Changed
+- Removed naive artist-wide genre normalization.
+
+## [0.1.2]
+
+### Added
+- Album readiness states
+- Better metadata review notes
+
+## [0.1.1]
+
+### Fixed
+- Artwork selector behavior.
+
+## [0.1]
+
+### Added
+- Read-only recursive discovery
+- Metadata audit
+- Album grouping
+- Rename planning
+- CSV reports
+- Persistent state/resume

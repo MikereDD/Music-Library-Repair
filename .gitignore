@@ -1,0 +1,64 @@
+# Runtime state / reports
+Music-Library-Repair/
+**/Music-Library-Repair/
+state.json
+tracks.csv
+albums.csv
+rename-plan.csv
+source-decode-audit.csv
+strict-decode-audit.csv
+apply-report.csv
+cover-cache/
+Backups/
+backups/
+
+# Temporary and generated files
+*.tmp
+*.temp
+*.bak
+*.log
+*.zip
+*.7z
+*.rar
+
+# Media: never commit user library content or test music by accident
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.opus
+*.wav
+*.wma
+*.aiff
+*.aif
+*.ape
+*.wv
+*.m4b
+*.mp4
+*.mkv
+*.avi
+*.mov
+
+# Artwork / extracted covers
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PowerShell / test output
+TestResults/
+coverage/
+
+# Repository-owned branding/assets are allowed
+!assets/
+!assets/**
