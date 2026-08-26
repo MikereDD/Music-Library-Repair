@@ -2,7 +2,7 @@
 
 **Typezer∅ Music Library Repair** is a safety-first Windows/PowerShell toolkit for auditing, normalizing, repairing, and verifying music libraries without re-encoding healthy audio.
 
-> Current development baseline: **v0.7-dev.2**
+> Current development baseline: **v0.7-dev.4.2**
 
 The project grew out of real-world cleanup work against large, inconsistent music libraries. Its core rule is simple:
 
@@ -99,6 +99,28 @@ Run a non-interactive, read-only whole-library audit:
 
 `-AuditOnly` writes reports under `$HOME\Downloads\Music-Library-Repair\audit` and deliberately does **not** modify persistent repair/review state.
 
+
+Analyze the most recent audit reports **without decoding the library again**:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -AnalyzeAuditReports
+```
+
+This produces failure classification reports by extension, decoder signature, album concentration, and ffprobe/decode cross-check.
+
+
+Recheck only the files that failed the previous audit, using the hardened **audio-only** decode path:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -RecheckAuditFailures
+```
+
+This avoids another 41k-file pass while determining how many prior failures were caused by non-audio streams such as malformed embedded artwork. Results are written to `audit\audio-only-recheck.csv`.
+
 Apply only albums explicitly marked reviewed/approved:
 
 ```powershell
@@ -126,6 +148,11 @@ Typical runtime output includes:
 - `source-decode-audit.csv`
 - `apply-report.csv`
 - `replacement-needed.csv`
+- `decode-failures-by-extension.csv`
+- `decode-error-signatures.csv`
+- `decode-failures-by-album.csv`
+- `audit-crosscheck.csv`
+- `audio-only-recheck.csv`
 - `state.json`
 - `cover-cache\`
 - `Backups\`

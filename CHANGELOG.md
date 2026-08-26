@@ -6,7 +6,20 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 
 ## [Unreleased]
 
+### Fixed
+- Wrapped mutually exclusive mode selection in an explicit array. Under strict mode, a single selected switch could collapse to a scalar Boolean and `.Count` raised before the startup banner.
+- Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
+
 ### Added
+- `-RecheckAuditFailures` mode to retest only previously failed files instead of re-decoding the entire library
+- `audio-only-recheck.csv` report
+- Strict audio decode now disables video, subtitle, and data streams at both input and output so malformed attached artwork cannot be misclassified as source-audio corruption
+- `-AnalyzeAuditReports` mode to classify an existing whole-library audit without re-decoding media
+- Decode failures grouped by audio extension
+- Normalized decoder-error signature report
+- Per-album failure concentration classification: isolated, partial, mostly-album, or whole-album
+- ffprobe vs strict-decode cross-check report
+- Classification is also generated automatically at the end of future `-AuditOnly` runs
 - Real `-AuditOnly` mode for non-interactive, read-only library-wide auditing
 - Audit reports isolated under `Music-Library-Repair\audit` so an audit cannot overwrite an in-progress repair `state.json`
 - Audit summary counts for album status, probe errors, strict decode failures, suspicious titles, and missing embedded artwork

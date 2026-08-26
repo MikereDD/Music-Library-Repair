@@ -21,6 +21,12 @@ Next:
 ## Near-term
 
 - [x] non-interactive `-AuditOnly` whole-library reporting mode
+- [x] classify strict-decode failures by extension and error signature
+- [x] classify failure concentration by album
+- [x] ffprobe/strict-decode cross-check reporting
+- [x] analyze existing audit reports without re-decoding media
+- [x] isolate strict source-audio decode from attached artwork/non-audio streams
+- [x] targeted recheck of previous audit failures
 - missing-track / track-number gap detector
 - disc-aware gap detection
 - authoritative MusicBrainz tracklist comparison

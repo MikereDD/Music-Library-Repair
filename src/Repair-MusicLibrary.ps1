@@ -9,13 +9,15 @@ param(
     [switch]$BackupOriginals,
     [switch]$Yes,
     [switch]$SkipSourceDecodeAudit,
-    [switch]$AuditOnly
+    [switch]$AuditOnly,
+    [switch]$AnalyzeAuditReports,
+    [switch]$RecheckAuditFailures
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.2"
+$ToolVersion = "0.7-dev.4.2"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -82,8 +84,12 @@ function Test-SourceAudioDecode {
     )
 
     $output = @(
+        # Disable video/subtitle/data processing at the input as well as the
+        # output. This is important for MP3/FLAC files carrying malformed
+        # attached artwork: bad cover art must not become SOURCE AUDIO ERROR.
         & ffmpeg -hide_banner -v error -xerror -err_detect explode `
-            -i $File.FullName -map 0:a:0 -f null - 2>&1
+            -vn -sn -dn -i $File.FullName `
+            -map 0:a:0 -vn -sn -dn -f null - 2>&1
     )
 
     $exit = $LASTEXITCODE
@@ -222,6 +228,368 @@ function Export-ReplacementQueue {
     $rows |
         Sort-Object AlbumDirectory, Disc, Track, FileName |
         Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+}
+
+
+function Get-DecodeErrorSignature {
+    param([string]$ErrorText)
+
+    if ([string]::IsNullOrWhiteSpace($ErrorText)) {
+        return "(no decoder error text)"
+    }
+
+    $known = [ordered]@{
+        "Header missing"                            = "Header missing"
+        "Invalid data found when processing input" = "Invalid data found when processing input"
+        "Error while decoding stream"               = "Error while decoding stream"
+        "Error submitting packet to decoder"        = "Error submitting packet to decoder"
+        "Invalid frame size"                        = "Invalid frame size"
+        "Failed to read frame size"                 = "Failed to read frame size"
+        "Could not find codec parameters"           = "Could not find codec parameters"
+        "moov atom not found"                       = "moov atom not found"
+        "CRC mismatch"                              = "CRC mismatch"
+        "corrupt"                                   = "Corrupt data/frame"
+        "End of file"                               = "Unexpected end of file"
+        "Invalid argument"                          = "Invalid argument"
+    }
+
+    foreach ($pattern in $known.Keys) {
+        if ($ErrorText -match [regex]::Escape($pattern)) {
+            return $known[$pattern]
+        }
+    }
+
+    $first = (($ErrorText -split '\s*\|\s*')[0]).Trim()
+    $first = $first -replace '@\s*0x[0-9A-Fa-f]+', '@ <addr>'
+    $first = $first -replace '0x[0-9A-Fa-f]+', '<hex>'
+    $first = $first -replace '\s+', ' '
+
+    if ($first.Length -gt 180) {
+        $first = $first.Substring(0, 180)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($first)) {
+        return "(unclassified decoder error)"
+    }
+
+    return $first
+}
+
+function Test-ProbeFailureValue {
+    param($Value)
+
+    if ($null -eq $Value) { return $false }
+
+    $s = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($s)) { return $false }
+    if ($s -ieq "False") { return $false }
+    if ($s -eq "0") { return $false }
+
+    return $true
+}
+
+function Export-AuditFailureClassification {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IEnumerable]$Tracks,
+        [Parameter(Mandatory)]
+        [string]$OutputRoot
+    )
+
+    $all = @($Tracks)
+    $failed = @($all | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+
+    $byExtensionPath = Join-Path $OutputRoot "decode-failures-by-extension.csv"
+    $signaturePath = Join-Path $OutputRoot "decode-error-signatures.csv"
+    $byAlbumPath = Join-Path $OutputRoot "decode-failures-by-album.csv"
+    $crosscheckPath = Join-Path $OutputRoot "audit-crosscheck.csv"
+
+    $byExtension = @(
+        $all |
+        Group-Object {
+            $ext = [string]$_.Extension
+            if ([string]::IsNullOrWhiteSpace($ext)) {
+                $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+            }
+            if ([string]::IsNullOrWhiteSpace($ext)) { "(none)" } else { $ext.ToLowerInvariant() }
+        } |
+        ForEach-Object {
+            $items = @($_.Group)
+            $decodeFail = @($items | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+            $probeFail = @($items | Where-Object { Test-ProbeFailureValue $_.ProbeError })
+            $both = @($items | Where-Object {
+                $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" -and
+                (Test-ProbeFailureValue $_.ProbeError)
+            })
+
+            [pscustomobject]@{
+                Extension            = $_.Name
+                TotalFiles           = $items.Count
+                DecodePass           = @($items | Where-Object { $_.SourceDecodeStatus -eq "PASS" }).Count
+                DecodeFail           = $decodeFail.Count
+                DecodeFailPercent    = if ($items.Count) { [math]::Round(($decodeFail.Count / $items.Count) * 100, 2) } else { 0 }
+                ProbeErrors          = $probeFail.Count
+                DecodeAndProbeErrors = $both.Count
+            }
+        } |
+        Sort-Object @{Expression="DecodeFail";Descending=$true}, @{Expression="TotalFiles";Descending=$true}, Extension
+    )
+    $byExtension | Export-Csv -LiteralPath $byExtensionPath -NoTypeInformation -Encoding UTF8
+
+    $signatureRows = @(
+        $failed |
+        Group-Object { Get-DecodeErrorSignature ([string]$_.SourceDecodeError) } |
+        ForEach-Object {
+            $items = @($_.Group)
+            [pscustomobject]@{
+                Signature  = $_.Name
+                Files      = $items.Count
+                Albums     = @($items.Directory | Where-Object { $_ } | Sort-Object -Unique).Count
+                Extensions = (@(
+                    $items | ForEach-Object {
+                        $ext = [string]$_.Extension
+                        if ([string]::IsNullOrWhiteSpace($ext)) {
+                            $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+                        }
+                        if ($ext) { $ext.ToLowerInvariant() }
+                    } | Where-Object { $_ } | Sort-Object -Unique
+                ) -join "; ")
+            }
+        } |
+        Sort-Object @{Expression="Files";Descending=$true}, Signature
+    )
+    $signatureRows | Export-Csv -LiteralPath $signaturePath -NoTypeInformation -Encoding UTF8
+
+    $albumRows = @(
+        $all |
+        Group-Object Directory |
+        ForEach-Object {
+            $items = @($_.Group)
+            $bad = @($items | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+
+            if ($bad.Count -eq 0) { return }
+
+            $pattern =
+                if ($bad.Count -eq $items.Count) { "WholeAlbum" }
+                elseif ($bad.Count -eq 1) { "IsolatedTrack" }
+                elseif (($bad.Count / [math]::Max($items.Count, 1)) -ge 0.5) { "MostlyAlbum" }
+                else { "PartialAlbum" }
+
+            [pscustomobject]@{
+                AlbumDirectory = $_.Name
+                Artist         = Get-DominantValue $items.Artist
+                Album          = Get-DominantValue $items.Album
+                Tracks         = $items.Count
+                DecodeFailures = $bad.Count
+                FailurePercent = [math]::Round(($bad.Count / [math]::Max($items.Count, 1)) * 100, 2)
+                Pattern        = $pattern
+                Extensions     = (@(
+                    $items | ForEach-Object {
+                        $ext = [string]$_.Extension
+                        if ([string]::IsNullOrWhiteSpace($ext)) {
+                            $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+                        }
+                        if ($ext) { $ext.ToLowerInvariant() }
+                    } | Where-Object { $_ } | Sort-Object -Unique
+                ) -join "; ")
+            }
+        } |
+        Sort-Object @{Expression="DecodeFailures";Descending=$true}, @{Expression="FailurePercent";Descending=$true}, AlbumDirectory
+    )
+    $albumRows | Export-Csv -LiteralPath $byAlbumPath -NoTypeInformation -Encoding UTF8
+
+    $crosscheckRows = @(
+        $all |
+        ForEach-Object {
+            $decodeFail = $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR"
+            $probeFail = Test-ProbeFailureValue $_.ProbeError
+
+            $category =
+                if ($decodeFail -and $probeFail) { "Decode+Probe" }
+                elseif ($decodeFail) { "DecodeOnly" }
+                elseif ($probeFail) { "ProbeOnly" }
+                else { "Neither" }
+
+            $ext = [string]$_.Extension
+            if ([string]::IsNullOrWhiteSpace($ext)) {
+                $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+            }
+
+            [pscustomobject]@{
+                Category = $category
+                Path = $_.Path
+                Directory = $_.Directory
+                FileName = $_.FileName
+                Extension = if ($ext) { $ext.ToLowerInvariant() } else { "(none)" }
+                SourceDecodeStatus = $_.SourceDecodeStatus
+                DecodeSignature = if ($decodeFail) { Get-DecodeErrorSignature ([string]$_.SourceDecodeError) } else { $null }
+                ProbeError = $_.ProbeError
+            }
+        }
+    )
+    $crosscheckRows | Export-Csv -LiteralPath $crosscheckPath -NoTypeInformation -Encoding UTF8
+
+    $patternSummary = @(
+        $albumRows |
+        Group-Object Pattern |
+        ForEach-Object {
+            [pscustomobject]@{
+                Pattern = $_.Name
+                Albums = $_.Count
+                FailedTracks = [int](@($_.Group | Measure-Object DecodeFailures -Sum).Sum)
+            }
+        } |
+        Sort-Object @{Expression="FailedTracks";Descending=$true}
+    )
+
+    $crossSummary = @(
+        $crosscheckRows |
+        Group-Object Category |
+        ForEach-Object {
+            [pscustomobject]@{ Category = $_.Name; Files = $_.Count }
+        } |
+        Sort-Object @{Expression="Files";Descending=$true}
+    )
+
+    return [pscustomobject]@{
+        FailedTracks     = $failed.Count
+        FailureAlbums    = $albumRows.Count
+        ByExtension      = $byExtension
+        Signatures       = $signatureRows
+        AlbumPatterns    = $patternSummary
+        Crosscheck       = $crossSummary
+        ByExtensionPath  = $byExtensionPath
+        SignaturePath    = $signaturePath
+        ByAlbumPath      = $byAlbumPath
+        CrosscheckPath   = $crosscheckPath
+    }
+}
+
+function Show-AuditFailureClassification {
+    param(
+        [Parameter(Mandatory)]
+        $Classification
+    )
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " SOURCE FAILURE CLASSIFICATION"
+    Write-Host ("=" * 72)
+    Write-Host "Failed tracks  : $($Classification.FailedTracks)"
+    Write-Host "Affected albums: $($Classification.FailureAlbums)"
+
+    Write-Host ""
+    Write-Host "Failures by extension:"
+    foreach ($row in @($Classification.ByExtension | Where-Object { $_.DecodeFail -gt 0 } | Select-Object -First 12)) {
+        Write-Host ("  {0,-8} {1,6} fail / {2,6} total  ({3,6}%)" -f $row.Extension,$row.DecodeFail,$row.TotalFiles,$row.DecodeFailPercent)
+    }
+
+    Write-Host ""
+    Write-Host "Top decoder signatures:"
+    foreach ($row in @($Classification.Signatures | Select-Object -First 12)) {
+        Write-Host ("  {0,6}  {1}" -f $row.Files,$row.Signature)
+    }
+
+    Write-Host ""
+    Write-Host "Failure concentration:"
+    foreach ($row in $Classification.AlbumPatterns) {
+        Write-Host ("  {0,-14} {1,5} album(s), {2,6} failed track(s)" -f $row.Pattern,$row.Albums,$row.FailedTracks)
+    }
+
+    Write-Host ""
+    Write-Host "ffprobe / strict-decode cross-check:"
+    foreach ($row in $Classification.Crosscheck) {
+        Write-Host ("  {0,-14} {1,6}" -f $row.Category,$row.Files)
+    }
+
+    Write-Host ""
+    Write-Host "Classification reports:"
+    Write-Host "  $($Classification.ByExtensionPath)"
+    Write-Host "  $($Classification.SignaturePath)"
+    Write-Host "  $($Classification.ByAlbumPath)"
+    Write-Host "  $($Classification.CrosscheckPath)"
+}
+
+
+function Invoke-AuditFailureRecheck {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TrackReportPath,
+        [Parameter(Mandatory)]
+        [string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $TrackReportPath -PathType Leaf)) {
+        throw "Existing audit report not found: $TrackReportPath`nRun -AuditOnly first."
+    }
+
+    $rows = @(Import-Csv -LiteralPath $TrackReportPath)
+    $oldFailures = @($rows | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+    $reportPath = Join-Path $OutputRoot "audio-only-recheck.csv"
+
+    Write-Host "Existing strict-decode failures: $($oldFailures.Count)"
+    Write-Host "Rechecking only those files with non-audio streams disabled..."
+    Write-Host ""
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $i = 0
+
+    foreach ($row in $oldFailures) {
+        $i++
+        Write-Progress -Activity "Audio-only failure recheck" -Status "$i / $($oldFailures.Count)" -PercentComplete (($i / [math]::Max($oldFailures.Count,1)) * 100)
+
+        $path = [string]$row.Path
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                Path             = $path
+                FileName         = $row.FileName
+                Directory        = $row.Directory
+                Extension        = $row.Extension
+                PreviousStatus   = $row.SourceDecodeStatus
+                RecheckStatus    = "MISSING FILE"
+                RecheckExitCode  = $null
+                RecheckError     = "File no longer exists."
+                PreviousError    = $row.SourceDecodeError
+            })
+            continue
+        }
+
+        $decode = Test-SourceAudioDecode -File (Get-Item -LiteralPath $path)
+        $results.Add([pscustomobject]@{
+            Path             = $path
+            FileName         = $row.FileName
+            Directory        = $row.Directory
+            Extension        = if ($row.Extension) { $row.Extension } else { [System.IO.Path]::GetExtension($path) }
+            PreviousStatus   = $row.SourceDecodeStatus
+            RecheckStatus    = if ($decode.Clean) { "PASS" } else { "SOURCE AUDIO ERROR" }
+            RecheckExitCode  = $decode.ExitCode
+            RecheckError     = $decode.ErrorText
+            PreviousError    = $row.SourceDecodeError
+        })
+    }
+
+    Write-Progress -Activity "Audio-only failure recheck" -Completed
+
+    $results | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+    $pass = @($results | Where-Object { $_.RecheckStatus -eq "PASS" }).Count
+    $fail = @($results | Where-Object { $_.RecheckStatus -eq "SOURCE AUDIO ERROR" }).Count
+    $missing = @($results | Where-Object { $_.RecheckStatus -eq "MISSING FILE" }).Count
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " AUDIO-ONLY FAILURE RECHECK COMPLETE"
+    Write-Host ("=" * 72)
+    Write-Host "Previously failed : $($oldFailures.Count)"
+    Write-Host "Now PASS          : $pass"
+    Write-Host "Still audio error : $fail"
+    Write-Host "Missing files     : $missing"
+    Write-Host ""
+    Write-Host "Report:"
+    Write-Host "  $reportPath"
+    Write-Host ""
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
 }
 
 function Get-FFProbeInfo {
@@ -952,7 +1320,8 @@ function Test-TempTrack {
     # -xerror makes any decoder error fatal so a "PASS" really means a clean decode.
     $decodeOutput = @(
         & ffmpeg -hide_banner -v error -xerror -err_detect explode `
-            -i $TempPath -map 0:a:0 -f null - 2>&1
+            -vn -sn -dn -i $TempPath `
+            -map 0:a:0 -vn -sn -dn -f null - 2>&1
     )
 
     if ($LASTEXITCODE -ne 0 -or $decodeOutput.Count -gt 0) {
@@ -1337,18 +1706,33 @@ function Invoke-ApprovedApply {
 }
 
 if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw "Root directory does not exist: $Root" }
-if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) { throw "ffprobe was not found in PATH." }
 
-if ($AuditOnly -and $ApplyApproved) {
-    throw "-AuditOnly and -ApplyApproved cannot be used together."
+$exclusiveModes = @(
+    @(
+        [bool]$AuditOnly,
+        [bool]$AnalyzeAuditReports,
+        [bool]$RecheckAuditFailures,
+        [bool]$ApplyApproved
+    ) | Where-Object { $_ }
+)
+
+if ($exclusiveModes.Count -gt 1) {
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, and -ApplyApproved are mutually exclusive modes."
+}
+
+if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+    throw "ffprobe was not found in PATH."
+}
+
+if ($RecheckAuditFailures -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+    throw "ffmpeg was not found in PATH."
 }
 
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
-# Audit-only output is intentionally isolated from persistent repair state.
-# This prevents a whole-library audit from overwriting an in-progress album
-# review stored in $StateRoot\state.json.
-$ReportRoot = if ($AuditOnly) { Join-Path $StateRoot "audit" } else { $StateRoot }
+# Audit/report-analysis output is intentionally isolated from persistent repair
+# state so whole-library analysis cannot overwrite an in-progress review.
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -1356,12 +1740,19 @@ $TrackReport = Join-Path $ReportRoot "tracks.csv"
 $AlbumReport = Join-Path $ReportRoot "albums.csv"
 $PlanReport = Join-Path $ReportRoot "rename-plan.csv"
 $ReplacementReport = Join-Path $ReportRoot "replacement-needed.csv"
+$DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($RecheckAuditFailures) {
+    "RECHECK AUDIT FAILURES"
+}
+elseif ($AnalyzeAuditReports) {
+    "ANALYZE AUDIT REPORTS"
 }
 elseif ($AuditOnly) {
     "AUDIT ONLY"
@@ -1371,6 +1762,31 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($RecheckAuditFailures) {
+    Invoke-AuditFailureRecheck -TrackReportPath $TrackReport -OutputRoot $ReportRoot
+    return
+}
+
+if ($AnalyzeAuditReports) {
+    if (-not (Test-Path -LiteralPath $TrackReport -PathType Leaf)) {
+        throw "Existing audit report not found: $TrackReport`nRun -AuditOnly first."
+    }
+
+    Write-Host "Loading existing audit report:"
+    Write-Host "  $TrackReport"
+
+    $existingTracks = @(Import-Csv -LiteralPath $TrackReport)
+    Write-Host "Tracks loaded: $($existingTracks.Count)"
+
+    $classification = Export-AuditFailureClassification -Tracks $existingTracks -OutputRoot $ReportRoot
+    Show-AuditFailureClassification -Classification $classification
+
+    Write-Host ""
+    Write-Host "No media files were decoded or modified."
+    Write-Host "Persistent repair state was NOT modified."
+    return
+}
 
 $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Extension.ToLowerInvariant() -in $AudioExtensions })
@@ -1441,7 +1857,6 @@ else {
 }
 
 $tracks | Export-Csv -LiteralPath $TrackReport -NoTypeInformation -Encoding UTF8
-$DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
 $tracks |
     Select-Object Path,Directory,FileName,SourceDecodeStatus,SourceDecodeExitCode,SourceDecodeError |
     Export-Csv -LiteralPath $DecodeReport -NoTypeInformation -Encoding UTF8
@@ -1593,6 +2008,10 @@ if ($AuditOnly) {
     }
     Write-Host "Suspicious titles    : $suspiciousTitleCount"
     Write-Host "Missing embedded art : $missingEmbeddedCount"
+
+    $classification = Export-AuditFailureClassification -Tracks $tracks -OutputRoot $ReportRoot
+    Show-AuditFailureClassification -Classification $classification
+
     Write-Host ""
     Write-Host "Reports:"
     Write-Host "  $TrackReport"
