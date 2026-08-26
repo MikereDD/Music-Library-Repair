@@ -7,10 +7,22 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 ## [Unreleased]
 
 ### Fixed
+- Preserve combined error evidence instead of letting `AUDIO` override simultaneous `CONTAINER` or `ARTWORK` evidence
+- Combined domains now surface explicitly (`AUDIO+CONTAINER`, `AUDIO+ARTWORK`, `ARTWORK+CONTAINER`, or all three)
+- Combined-domain dispositions default conservatively to `ManualReview`
 - Wrapped mutually exclusive mode selection in an explicit array. Under strict mode, a single selected switch could collapse to a scalar Boolean and `.Count` raised before the startup banner.
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- Canonical FFmpeg error signatures that remove volatile decoder addresses
+- Independent error domains: `AUDIO`, `ARTWORK`, `CONTAINER`, `MIXED`, `UNKNOWN`
+- Domain-aware failure dispositions: `RepairArtwork`, `ContainerReview`, `AudioReview`, `ManualReview`, `ReplacementReview`
+- Severity now combines audio completion with error domain instead of treating all FFmpeg stderr equally
+- `-AnalyzeFailureSeverity` diagnostic mode
+- Configurable `-FailureSamplesPerSignature` sampling (default 5), spread across albums where possible
+- Tolerant audio decode diagnostics comparing decoded progress with ffprobe-reported duration
+- Diagnostic severity buckets: `DegradedButComplete`, `MostlyDecodable`, `DecodableWithErrors`, `Severe`, and `MissingFile`
+- `failure-severity-samples.csv`
 - `-RecheckAuditFailures` mode to retest only previously failed files instead of re-decoding the entire library
 - `audio-only-recheck.csv` report
 - Strict audio decode now disables video, subtitle, and data streams at both input and output so malformed attached artwork cannot be misclassified as source-audio corruption

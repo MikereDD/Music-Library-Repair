@@ -2,7 +2,7 @@
 
 **Typezer∅ Music Library Repair** is a safety-first Windows/PowerShell toolkit for auditing, normalizing, repairing, and verifying music libraries without re-encoding healthy audio.
 
-> Current development baseline: **v0.7-dev.4.2**
+> Current development baseline: **v0.7-dev.6.1**
 
 The project grew out of real-world cleanup work against large, inconsistent music libraries. Its core rule is simple:
 
@@ -121,6 +121,17 @@ Recheck only the files that failed the previous audit, using the hardened **audi
 
 This avoids another 41k-file pass while determining how many prior failures were caused by non-audio streams such as malformed embedded artwork. Results are written to `audit\audio-only-recheck.csv`.
 
+Sample and characterize the remaining strict audio failures:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -AnalyzeFailureSeverity
+```
+
+The default is five samples per normalized decoder-error signature, spread across albums where possible. The diagnostic performs a tolerant audio decode and compares decoded progress with the reported duration. Increase sampling with `-FailureSamplesPerSignature 10`.
+
+
 Apply only albums explicitly marked reviewed/approved:
 
 ```powershell
@@ -153,6 +164,7 @@ Typical runtime output includes:
 - `decode-failures-by-album.csv`
 - `audit-crosscheck.csv`
 - `audio-only-recheck.csv`
+- `failure-severity-samples.csv`
 - `state.json`
 - `cover-cache\`
 - `Backups\`
@@ -207,3 +219,12 @@ This repository is the development home. A tagged v1.0 release will be produced 
 ## License
 
 MIT. See [LICENSE.md](LICENSE.md).
+
+
+## v0.7-dev.6 failure-domain model
+
+Failure diagnostics now normalize volatile FFmpeg decoder addresses and classify messages into independent domains: `AUDIO`, `ARTWORK`, `CONTAINER`, combined domains such as `AUDIO+CONTAINER`, and `UNKNOWN`.
+
+Severity is based on actual audio completion plus the error domain. A malformed embedded PNG/JPEG that leaves audio complete is therefore an artwork-repair problem, not automatically a source-audio replacement.
+
+`-AnalyzeFailureSeverity` now reports conservative dispositions such as `RepairArtwork`, `ContainerReview`, `AudioReview`, `ManualReview`, and `ReplacementReview`.

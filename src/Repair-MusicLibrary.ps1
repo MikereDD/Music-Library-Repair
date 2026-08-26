@@ -11,13 +11,16 @@ param(
     [switch]$SkipSourceDecodeAudit,
     [switch]$AuditOnly,
     [switch]$AnalyzeAuditReports,
-    [switch]$RecheckAuditFailures
+    [switch]$RecheckAuditFailures,
+    [switch]$AnalyzeFailureSeverity,
+    [ValidateRange(1,50)]
+    [int]$FailureSamplesPerSignature = 5
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.4.2"
+$ToolVersion = "0.7-dev.6.1"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -238,32 +241,40 @@ function Get-DecodeErrorSignature {
         return "(no decoder error text)"
     }
 
-    $known = [ordered]@{
-        "Header missing"                            = "Header missing"
-        "Invalid data found when processing input" = "Invalid data found when processing input"
-        "Error while decoding stream"               = "Error while decoding stream"
-        "Error submitting packet to decoder"        = "Error submitting packet to decoder"
-        "Invalid frame size"                        = "Invalid frame size"
-        "Failed to read frame size"                 = "Failed to read frame size"
-        "Could not find codec parameters"           = "Could not find codec parameters"
-        "moov atom not found"                       = "moov atom not found"
-        "CRC mismatch"                              = "CRC mismatch"
-        "corrupt"                                   = "Corrupt data/frame"
-        "End of file"                               = "Unexpected end of file"
-        "Invalid argument"                          = "Invalid argument"
-    }
+    $normalized = $ErrorText
+    $normalized = $normalized -replace '@\s*(?:0x)?[0-9A-Fa-f]{8,}', '@ <addr>'
+    $normalized = $normalized -replace '\[(png|mjpeg|jpeg|webp|gif)\s+@\s+<addr>\]', '[$1]'
+    $normalized = $normalized -replace '\[(mp3float|mp3|flac|aac|vorbis|opus|wmalossless|wmav2|alac)\s+@\s+<addr>\]', '[$1]'
+    $normalized = $normalized -replace '\s+', ' '
 
-    foreach ($pattern in $known.Keys) {
-        if ($ErrorText -match [regex]::Escape($pattern)) {
-            return $known[$pattern]
+    $rules = @(
+        @{ Pattern='\[png\].*chunk too big';                         Signature='PNG artwork: chunk too big' },
+        @{ Pattern='\[(?:mjpeg|jpeg)\].*No JPEG data found';         Signature='JPEG artwork: no JPEG data found' },
+        @{ Pattern='\[webp\].*';                                     Signature='WebP artwork decode error' },
+        @{ Pattern='\[gif\].*';                                      Signature='GIF artwork decode error' },
+        @{ Pattern='\[(?:mp3float|mp3)\].*invalid new backstep';     Signature='MP3 audio: invalid new backstep' },
+        @{ Pattern='\[(?:mp3float|mp3)\].*Header missing';           Signature='MP3 audio: header missing' },
+        @{ Pattern='Header missing';                                 Signature='Audio: header missing' },
+        @{ Pattern='Invalid data found when processing input';       Signature='Container: invalid input data' },
+        @{ Pattern='Incorrect BOM value';                            Signature='Container: incorrect BOM' },
+        @{ Pattern='Error while decoding stream';                    Signature='Audio: decode stream error' },
+        @{ Pattern='Error submitting packet to decoder';             Signature='Audio: packet submission error' },
+        @{ Pattern='Invalid frame size';                             Signature='Audio: invalid frame size' },
+        @{ Pattern='Failed to read frame size';                      Signature='Audio: failed to read frame size' },
+        @{ Pattern='CRC mismatch';                                   Signature='Audio: CRC mismatch' },
+        @{ Pattern='moov atom not found';                            Signature='Container: moov atom missing' },
+        @{ Pattern='Could not find codec parameters';                Signature='Container: codec parameters unavailable' },
+        @{ Pattern='Invalid argument';                               Signature='Container/decoder: invalid argument' },
+        @{ Pattern='End of file';                                    Signature='Container: unexpected EOF' }
+    )
+
+    foreach ($rule in $rules) {
+        if ($normalized -match $rule.Pattern) {
+            return $rule.Signature
         }
     }
 
-    $first = (($ErrorText -split '\s*\|\s*')[0]).Trim()
-    $first = $first -replace '@\s*0x[0-9A-Fa-f]+', '@ <addr>'
-    $first = $first -replace '0x[0-9A-Fa-f]+', '<hex>'
-    $first = $first -replace '\s+', ' '
-
+    $first = (($normalized -split '\s*\|\s*')[0]).Trim()
     if ($first.Length -gt 180) {
         $first = $first.Substring(0, 180)
     }
@@ -273,6 +284,135 @@ function Get-DecodeErrorSignature {
     }
 
     return $first
+}
+
+function Get-DecodeErrorDomain {
+    param([string]$ErrorText)
+
+    if ([string]::IsNullOrWhiteSpace($ErrorText)) {
+        return "NONE"
+    }
+
+    $normalized = $ErrorText -replace '@\s*(?:0x)?[0-9A-Fa-f]{8,}', '@ <addr>'
+
+    $hasArtwork = $normalized -match '\[(?:png|mjpeg|jpeg|webp|gif)\b' -or
+                  $normalized -match 'No JPEG data found|chunk too big'
+
+    $hasAudio = $normalized -match '\[(?:mp3float|mp3|flac|aac|vorbis|opus|wmalossless|wmav2|alac)\b' -or
+                $normalized -match 'Header missing|invalid new backstep|Error while decoding stream|Error submitting packet to decoder|Invalid frame size|Failed to read frame size|CRC mismatch'
+
+    $hasContainer = $normalized -match 'Invalid data found when processing input|Incorrect BOM value|moov atom not found|Could not find codec parameters|Invalid argument|End of file'
+
+    if ($hasAudio -and $hasArtwork -and $hasContainer) { return "AUDIO+ARTWORK+CONTAINER" }
+    if ($hasAudio -and $hasArtwork) { return "AUDIO+ARTWORK" }
+    if ($hasAudio -and $hasContainer) { return "AUDIO+CONTAINER" }
+    if ($hasArtwork -and $hasContainer) { return "ARTWORK+CONTAINER" }
+    if ($hasAudio) { return "AUDIO" }
+    if ($hasArtwork) { return "ARTWORK" }
+    if ($hasContainer) { return "CONTAINER" }
+    return "UNKNOWN"
+}
+
+function Get-FailureDisposition {
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [Nullable[double]]$ReportedSeconds,
+        [double]$DecodedSeconds,
+        [int]$TolerantExitCode
+    )
+
+    $ratio = $null
+    if ($null -ne $ReportedSeconds -and $ReportedSeconds -gt 0) {
+        $ratio = $DecodedSeconds / [double]$ReportedSeconds
+    }
+
+    if ($TolerantExitCode -ne 0) {
+        return [pscustomobject]@{
+            Severity = "Severe"
+            Action   = if ($Domain -eq "ARTWORK") { "RepairArtworkThenRetest" } else { "ReplacementReview" }
+        }
+    }
+
+    if ($null -eq $ratio) {
+        return [pscustomobject]@{
+            Severity = "DecodableWithErrors"
+            Action   = switch ($Domain) {
+                "ARTWORK"                 { "RepairArtwork" }
+                "CONTAINER"               { "ContainerReview" }
+                "AUDIO"                   { "AudioReview" }
+                "AUDIO+ARTWORK"           { "ManualReview" }
+                "AUDIO+CONTAINER"         { "ManualReview" }
+                "ARTWORK+CONTAINER"       { "ManualReview" }
+                "AUDIO+ARTWORK+CONTAINER" { "ManualReview" }
+                default                   { "ManualReview" }
+            }
+        }
+    }
+
+    if ($ratio -lt 0.95) {
+        return [pscustomobject]@{
+            Severity = "Severe"
+            Action   = if ($Domain -eq "ARTWORK") { "RepairArtworkThenRetest" } else { "ReplacementReview" }
+        }
+    }
+
+    if ($ratio -lt 0.99) {
+        return [pscustomobject]@{
+            Severity = "MostlyDecodable"
+            Action   = if ($Domain -eq "ARTWORK") { "RepairArtwork" } else { "AudioReview" }
+        }
+    }
+
+    switch ($Domain) {
+        "ARTWORK" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteArtworkError"
+                Action   = "RepairArtwork"
+            }
+        }
+        "CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteContainerError"
+                Action   = "ContainerReview"
+            }
+        }
+        "AUDIO" {
+            return [pscustomobject]@{
+                Severity = "AudioDegradedButComplete"
+                Action   = "AudioReview"
+            }
+        }
+        "AUDIO+ARTWORK" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        "AUDIO+CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        "ARTWORK+CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        "AUDIO+ARTWORK+CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteUnknownError"
+                Action   = "ManualReview"
+            }
+        }
+    }
 }
 
 function Test-ProbeFailureValue {
@@ -588,6 +728,252 @@ function Invoke-AuditFailureRecheck {
     Write-Host "Report:"
     Write-Host "  $reportPath"
     Write-Host ""
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+}
+
+
+function Get-ReportedAudioDurationSeconds {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $raw = @(
+        & ffprobe -v error -select_streams a:0 `
+            -show_entries format=duration `
+            -of default=noprint_wrappers=1:nokey=1 `
+            -- $Path 2>&1
+    )
+
+    if ($LASTEXITCODE -ne 0) { return $null }
+
+    $value = 0.0
+    if ([double]::TryParse(
+        (($raw | Select-Object -First 1) -as [string]),
+        [System.Globalization.NumberStyles]::Float,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [ref]$value
+    )) { return $value }
+
+    return $null
+}
+
+function Invoke-TolerantAudioDecodeDiagnostic {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $output = @(
+        & ffmpeg -hide_banner -v error `
+            -vn -sn -dn -i $Path `
+            -map 0:a:0 -vn -sn -dn `
+            -progress pipe:1 -nostats `
+            -f null - 2>&1
+    )
+    $exitCode = $LASTEXITCODE
+    $maxOutTimeUs = 0L
+    $errorLines = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($lineObj in $output) {
+        $line = [string]$lineObj
+
+        if ($line -match '^out_time_us=(\d+)$') {
+            $v = 0L
+            if ([long]::TryParse($Matches[1], [ref]$v) -and $v -gt $maxOutTimeUs) {
+                $maxOutTimeUs = $v
+            }
+            continue
+        }
+
+        if ($line -match '^(progress|bitrate|total_size|out_time_ms|out_time|dup_frames|drop_frames|speed|stream_\d+_\d+_q)=') {
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($line)) {
+            $errorLines.Add($line.Trim())
+        }
+    }
+
+    $errorText = $errorLines -join " | "
+
+    [pscustomobject]@{
+        ExitCode       = $exitCode
+        DecodedSeconds = if ($maxOutTimeUs -gt 0) { [math]::Round(($maxOutTimeUs / 1000000.0), 3) } else { 0.0 }
+        ErrorText      = $errorText
+        ErrorSignature = Get-DecodeErrorSignature $errorText
+    }
+}
+
+function Invoke-FailureSeverityAnalysis {
+    param(
+        [Parameter(Mandatory)][string]$RecheckReportPath,
+        [Parameter(Mandatory)][string]$OutputRoot,
+        [Parameter(Mandatory)][int]$SamplesPerSignature
+    )
+
+    if (-not (Test-Path -LiteralPath $RecheckReportPath -PathType Leaf)) {
+        throw "Audio-only recheck report not found: $RecheckReportPath`nRun -RecheckAuditFailures first."
+    }
+
+    $rows = @(
+        Import-Csv -LiteralPath $RecheckReportPath |
+        Where-Object { $_.RecheckStatus -eq "SOURCE AUDIO ERROR" }
+    )
+
+    if ($rows.Count -eq 0) {
+        Write-Host "No SOURCE AUDIO ERROR rows exist in the recheck report."
+        return
+    }
+
+    $withSignature = @(
+        foreach ($row in $rows) {
+            [pscustomobject]@{
+                Row       = $row
+                Signature = Get-DecodeErrorSignature ([string]$row.RecheckError)
+                Domain    = Get-DecodeErrorDomain ([string]$row.RecheckError)
+            }
+        }
+    )
+
+    $selected = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($group in ($withSignature | Group-Object Signature | Sort-Object Count -Descending)) {
+        $albumGroups = @($group.Group | Group-Object { $_.Row.Directory })
+        $taken = 0
+
+        foreach ($album in $albumGroups) {
+            if ($taken -ge $SamplesPerSignature) { break }
+            $selected.Add(@($album.Group | Select-Object -First 1)[0])
+            $taken++
+        }
+
+        if ($taken -lt $SamplesPerSignature) {
+            $already = @{}
+            foreach ($s in $selected) {
+                if ($s.Signature -eq $group.Name) { $already[[string]$s.Row.Path] = $true }
+            }
+
+            foreach ($candidate in $group.Group) {
+                if ($taken -ge $SamplesPerSignature) { break }
+                if (-not $already.ContainsKey([string]$candidate.Row.Path)) {
+                    $selected.Add($candidate)
+                    $already[[string]$candidate.Row.Path] = $true
+                    $taken++
+                }
+            }
+        }
+    }
+
+    $reportPath = Join-Path $OutputRoot "failure-severity-samples.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    Write-Host "Known strict audit failures : $($rows.Count)"
+    Write-Host "Canonical signatures        : $(($withSignature | Group-Object Signature).Count)"
+    Write-Host "Error domains               : $(($withSignature | Group-Object Domain).Count)"
+    Write-Host "Samples per signature       : $SamplesPerSignature"
+    Write-Host "Files selected              : $($selected.Count)"
+    Write-Host ""
+
+    $i = 0
+    foreach ($sample in $selected) {
+        $i++
+        $row = $sample.Row
+        $path = [string]$row.Path
+
+        Write-Progress -Activity "Failure severity analysis" `
+            -Status "$i / $($selected.Count)" `
+            -PercentComplete (($i / [math]::Max($selected.Count,1)) * 100)
+
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                Signature=$sample.Signature; Domain=$sample.Domain
+                Severity="MissingFile"; Action="LocateFile"; Path=$path
+                Directory=$row.Directory; FileName=$row.FileName; Extension=$row.Extension
+                ReportedDurationSeconds=$null; DecodedDurationSeconds=$null; DecodedPercent=$null
+                TolerantExitCode=$null; TolerantErrorSignature=$null
+                TolerantError="File no longer exists."; StrictError=$row.RecheckError
+            })
+            continue
+        }
+
+        $reported = Get-ReportedAudioDurationSeconds -Path $path
+        $diag = Invoke-TolerantAudioDecodeDiagnostic -Path $path
+        $disposition = Get-FailureDisposition `
+            -Domain $sample.Domain `
+            -ReportedSeconds $reported `
+            -DecodedSeconds $diag.DecodedSeconds `
+            -TolerantExitCode $diag.ExitCode
+
+        $percent = $null
+        if ($null -ne $reported -and $reported -gt 0) {
+            $percent = [math]::Round(($diag.DecodedSeconds / [double]$reported) * 100, 2)
+        }
+
+        $results.Add([pscustomobject]@{
+            Signature=$sample.Signature; Domain=$sample.Domain
+            Severity=$disposition.Severity; Action=$disposition.Action; Path=$path
+            Directory=$row.Directory; FileName=$row.FileName
+            Extension=if ($row.Extension) { $row.Extension } else { [System.IO.Path]::GetExtension($path) }
+            ReportedDurationSeconds=$reported; DecodedDurationSeconds=$diag.DecodedSeconds
+            DecodedPercent=$percent; TolerantExitCode=$diag.ExitCode
+            TolerantErrorSignature=$diag.ErrorSignature; TolerantError=$diag.ErrorText
+            StrictError=$row.RecheckError
+        })
+    }
+
+    Write-Progress -Activity "Failure severity analysis" -Completed
+
+    $results | Sort-Object Domain, Signature, Severity, Directory, FileName |
+        Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+    $summary = @(
+        $results | Group-Object Severity | ForEach-Object {
+            [pscustomobject]@{ Severity=$_.Name; Samples=$_.Count }
+        } | Sort-Object Samples -Descending
+    )
+
+    $domainSummary = @(
+        $results | Group-Object Domain | ForEach-Object {
+            [pscustomobject]@{ Domain=$_.Name; Samples=$_.Count }
+        } | Sort-Object Samples -Descending
+    )
+
+    $actionSummary = @(
+        $results | Group-Object Action | ForEach-Object {
+            [pscustomobject]@{ Action=$_.Name; Samples=$_.Count }
+        } | Sort-Object Samples -Descending
+    )
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " FAILURE SEVERITY SAMPLE ANALYSIS"
+    Write-Host ("=" * 72)
+    foreach ($row in $summary) {
+        Write-Host ("  {0,-30} {1,6}" -f $row.Severity,$row.Samples)
+    }
+
+    Write-Host ""
+    Write-Host "By error domain:"
+    foreach ($row in $domainSummary) {
+        Write-Host ("  {0,-12} {1,6}" -f $row.Domain,$row.Samples)
+    }
+
+    Write-Host ""
+    Write-Host "Recommended disposition:"
+    foreach ($row in $actionSummary) {
+        Write-Host ("  {0,-26} {1,6}" -f $row.Action,$row.Samples)
+    }
+
+    Write-Host ""
+    Write-Host "Per-signature sample results:"
+    foreach ($group in ($results | Group-Object Signature | Sort-Object Count -Descending)) {
+        $parts = @($group.Group | Group-Object Severity | ForEach-Object { "$($_.Name)=$($_.Count)" })
+        $domain = @($group.Group.Domain | Sort-Object -Unique) -join "+"
+        Write-Host ("  {0,6} sample(s)  [{1}] {2}" -f $group.Count,$domain,$group.Name)
+        Write-Host ("           " + ($parts -join ", "))
+    }
+
+    Write-Host ""
+    Write-Host "Report:"
+    Write-Host "  $reportPath"
+    Write-Host ""
+    Write-Host "Classification is diagnostic only; replacement state was not changed."
     Write-Host "No media files were modified."
     Write-Host "Persistent repair state was NOT modified."
 }
@@ -1712,27 +2098,31 @@ $exclusiveModes = @(
         [bool]$AuditOnly,
         [bool]$AnalyzeAuditReports,
         [bool]$RecheckAuditFailures,
+        [bool]$AnalyzeFailureSeverity,
         [bool]$ApplyApproved
     ) | Where-Object { $_ }
 )
 
 if ($exclusiveModes.Count -gt 1) {
-    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, and -ApplyApproved are mutually exclusive modes."
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, and -ApplyApproved are mutually exclusive modes."
 }
 
-if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
-if ($RecheckAuditFailures -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+if (($RecheckAuditFailures -or $AnalyzeFailureSeverity) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     throw "ffmpeg was not found in PATH."
+}
+if ($AnalyzeFailureSeverity -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+    throw "ffprobe was not found in PATH."
 }
 
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
 # Audit/report-analysis output is intentionally isolated from persistent repair
 # state so whole-library analysis cannot overwrite an in-progress review.
-$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures) { Join-Path $StateRoot "audit" } else { $StateRoot }
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -1741,12 +2131,16 @@ $AlbumReport = Join-Path $ReportRoot "albums.csv"
 $PlanReport = Join-Path $ReportRoot "rename-plan.csv"
 $ReplacementReport = Join-Path $ReportRoot "replacement-needed.csv"
 $DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
+$AudioOnlyRecheckReport = Join-Path $ReportRoot "audio-only-recheck.csv"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($AnalyzeFailureSeverity) {
+    "ANALYZE FAILURE SEVERITY"
 }
 elseif ($RecheckAuditFailures) {
     "RECHECK AUDIT FAILURES"
@@ -1762,6 +2156,14 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($AnalyzeFailureSeverity) {
+    Invoke-FailureSeverityAnalysis `
+        -RecheckReportPath $AudioOnlyRecheckReport `
+        -OutputRoot $ReportRoot `
+        -SamplesPerSignature $FailureSamplesPerSignature
+    return
+}
 
 if ($RecheckAuditFailures) {
     Invoke-AuditFailureRecheck -TrackReportPath $TrackReport -OutputRoot $ReportRoot

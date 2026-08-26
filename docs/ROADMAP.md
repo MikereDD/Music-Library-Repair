@@ -27,6 +27,11 @@ Next:
 - [x] analyze existing audit reports without re-decoding media
 - [x] isolate strict source-audio decode from attached artwork/non-audio streams
 - [x] targeted recheck of previous audit failures
+- [x] sampled failure-severity diagnostics before replacement decisions
+- [x] canonicalize volatile FFmpeg decoder signatures
+- [x] separate audio, artwork, container, mixed, and unknown error domains
+- [x] domain-aware severity/disposition model
+- [x] preserve combined error-domain evidence without precedence loss
 - missing-track / track-number gap detector
 - disc-aware gap detection
 - authoritative MusicBrainz tracklist comparison
