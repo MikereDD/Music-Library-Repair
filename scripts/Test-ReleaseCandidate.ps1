@@ -89,8 +89,15 @@ try {
     Assert-True ($versionMatch.Success) "ToolVersion declaration is present"
     Assert-True ($versionMatch.Groups["version"].Value -eq $ExpectedVersion) "VERSION matches ToolVersion"
 
+    $help = Get-Help -Name $MainScript -Full
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$help.Synopsis)) "comment-based help exposes a synopsis"
+    Assert-True ([string]$help.Synopsis -match "Audits, reviews, repairs") "comment-based help synopsis is the authored help text"
+    $helpDescription = @($help.Description | ForEach-Object { $_.Text }) -join " "
+    Assert-True ($helpDescription -match "Discover") "comment-based help exposes the canonical workflow description"
+
     $requiredSwitches = @(
-        "AuditOnly","ReviewReplacementCandidates","StageReplacementCandidates",
+        "AuditOnly","ClassifyAuditFailures","ReclassifyFailureDomains","BuildRepairQueue",
+        "ReviewReplacementCandidates","StageReplacementCandidates",
         "ApplyStagedReplacements","VerifyReplacementTransactions","BackupOriginals","Yes"
     )
     $paramNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
@@ -114,6 +121,25 @@ try {
     $auditTrackRow = $auditDecode | Where-Object Path -eq $AuditTrack | Select-Object -First 1
     Assert-True ($null -ne $auditTrackRow) "synthetic audit track appears in decode report"
     Assert-True ([string]$auditTrackRow.SourceDecodeStatus -eq "PASS") "synthetic FLAC strict decode passes"
+
+    # Raw decoder failures must remain observations only, never automatic
+    # replacement authorization.
+    $ObservedAlbum = Join-Path $LibraryRoot "Observed Failure\Broken Container (2026)"
+    $ObservedTrack = Join-Path $ObservedAlbum "01 - Broken Container.mp3"
+    New-Item -ItemType Directory -Force -Path $ObservedAlbum | Out-Null
+    [IO.File]::WriteAllBytes($ObservedTrack, [byte[]](0x49,0x44,0x33,0x04,0x00,0x00,0x00,0x00))
+
+    & $MainScript -Root $LibraryRoot -StateRoot $StateRoot -AuditOnly
+    $observationPath = Join-Path $AuditRoot "source-decode-observations.csv"
+    Assert-True (Test-Path -LiteralPath $observationPath -PathType Leaf) "AuditOnly writes source-decode-observations.csv"
+    $observations = @(Import-Csv -LiteralPath $observationPath)
+    $observedRow = $observations | Where-Object SourcePath -eq $ObservedTrack | Select-Object -First 1
+    Assert-True ($null -ne $observedRow) "synthetic decoder failure appears in observation report"
+    Assert-True ($observedRow.Status -eq "ObservedDecodeFailure") "raw decoder failure is marked as observation"
+    Assert-True ($observedRow.ObservationOnly -eq "True") "observation report explicitly marks evidence-only status"
+    Assert-True ($observedRow.ReplacementAuthorized -eq "False") "raw decoder failure does not authorize replacement"
+    Remove-Item -LiteralPath $ObservedTrack -Force
+    Remove-Item -LiteralPath $ObservedAlbum -Force -ErrorAction SilentlyContinue
 
     # Synthetic replacement fixtures, all under TEMP.
     $TxAlbumA = Join-Path $LibraryRoot "Transaction Artist\Same Extension (2026)"
@@ -166,6 +192,52 @@ try {
     Assert-True ($blocked[0].TransactionStatus -eq "Blocked") "unapproved quality downgrade is blocked"
     Assert-True ($blocked[0].BlockReason -eq "QualityDowngradeRequiresExplicitApproval") "downgrade block reason is explicit"
     Assert-True (Test-Path -LiteralPath $SourceDowngrade -PathType Leaf) "blocked downgrade leaves original source untouched"
+
+    # Negative transaction gates: missing staged file, changed staged hash,
+    # and pre-existing cross-extension target must all block before source mutation.
+    $NegAlbum = Join-Path $LibraryRoot "Transaction Artist\Negative Gates (2026)"
+    $SourceMissingStage = Join-Path $NegAlbum "01 - Missing Stage.flac"
+    $SourceHashChanged = Join-Path $NegAlbum "02 - Hash Changed.flac"
+    $SourceTargetExists = Join-Path $NegAlbum "03 - Target Exists.flac"
+    $StageHashChanged = Join-Path $StageRoot "negative\02 - Hash Changed.flac"
+    $StageTargetExists = Join-Path $StageRoot "negative\03 - Target Exists.mp3"
+    New-SyntheticFlac -Path $SourceMissingStage -Title "Missing Stage" -Frequency 910
+    New-SyntheticFlac -Path $SourceHashChanged -Title "Hash Changed" -Frequency 920
+    New-SyntheticFlac -Path $SourceTargetExists -Title "Target Exists" -Frequency 930
+    New-SyntheticFlac -Path $StageHashChanged -Title "Hash Changed Replacement" -Frequency 940
+    New-SyntheticMp3 -Path $StageTargetExists -Title "Target Exists Replacement" -Frequency 950
+
+    $TargetAlreadyThere = [IO.Path]::ChangeExtension($SourceTargetExists, ".mp3")
+    New-SyntheticMp3 -Path $TargetAlreadyThere -Title "Existing Target" -Frequency 960
+
+    $savedIntake = @(Import-Csv -LiteralPath $IntakePath)
+    $savedStage = @(Import-Csv -LiteralPath $StageManifestPath)
+
+    @(
+        [pscustomobject]@{SourcePath=$SourceMissingStage;CandidatePath="";StageApproved="Yes";ReplaceApproved="Yes";QualityDowngradeApproved="No";ReviewNotes="RC missing stage"},
+        [pscustomobject]@{SourcePath=$SourceHashChanged;CandidatePath=$StageHashChanged;StageApproved="Yes";ReplaceApproved="Yes";QualityDowngradeApproved="No";ReviewNotes="RC changed hash"},
+        [pscustomobject]@{SourcePath=$SourceTargetExists;CandidatePath=$StageTargetExists;StageApproved="Yes";ReplaceApproved="Yes";QualityDowngradeApproved="Yes";ReviewNotes="RC target exists"}
+    ) | Export-Csv -LiteralPath $IntakePath -NoTypeInformation -Encoding UTF8
+
+    @(
+        [pscustomobject]@{StageStatus="StagedVerified";BlockReason="";SourcePath=$SourceMissingStage;CandidatePath="";CandidateStatus="CandidateValidatedForReview";ForcedDemuxer="";StagedPath=(Join-Path $StageRoot "negative\missing.flac");CandidateSHA256=("0"*64);StagedSHA256=("0"*64);CopyHashVerified="True";StagedDecodeStatus="Pass";StagedAt=(Get-Date).ToString("o")},
+        [pscustomobject]@{StageStatus="StagedVerified";BlockReason="";SourcePath=$SourceHashChanged;CandidatePath=$StageHashChanged;CandidateStatus="CandidateValidatedForReview";ForcedDemuxer="";StagedPath=$StageHashChanged;CandidateSHA256=("f"*64);StagedSHA256=("f"*64);CopyHashVerified="True";StagedDecodeStatus="Pass";StagedAt=(Get-Date).ToString("o")},
+        [pscustomobject]@{StageStatus="StagedVerified";BlockReason="";SourcePath=$SourceTargetExists;CandidatePath=$StageTargetExists;CandidateStatus="CandidateValidatedForReview";ForcedDemuxer="";StagedPath=$StageTargetExists;CandidateSHA256=(Get-FileHash $StageTargetExists -Algorithm SHA256).Hash.ToLowerInvariant();StagedSHA256=(Get-FileHash $StageTargetExists -Algorithm SHA256).Hash.ToLowerInvariant();CopyHashVerified="True";StagedDecodeStatus="Pass";StagedAt=(Get-Date).ToString("o")}
+    ) | Export-Csv -LiteralPath $StageManifestPath -NoTypeInformation -Encoding UTF8
+
+    & $MainScript -Root $LibraryRoot -StateRoot $StateRoot -ApplyStagedReplacements -BackupOriginals -Yes
+    $negativeTx = @(Import-Csv -LiteralPath (Join-Path $AuditRoot "replacement-transaction-manifest.csv"))
+    Assert-True (@($negativeTx | Where-Object BlockReason -eq "StagedFileMissing").Count -eq 1) "missing staged file is blocked"
+    Assert-True (@($negativeTx | Where-Object BlockReason -eq "StagedHashChanged").Count -eq 1) "changed staged hash is blocked"
+    Assert-True (@($negativeTx | Where-Object BlockReason -eq "ReplacementTargetAlreadyExists").Count -eq 1) "pre-existing cross-extension target is blocked"
+    Assert-True (Test-Path -LiteralPath $SourceMissingStage) "missing-stage block leaves source untouched"
+    Assert-True (Test-Path -LiteralPath $SourceHashChanged) "hash-change block leaves source untouched"
+    Assert-True (Test-Path -LiteralPath $SourceTargetExists) "existing-target block leaves source untouched"
+
+    $savedIntake | Export-Csv -LiteralPath $IntakePath -NoTypeInformation -Encoding UTF8
+    $savedStage | Export-Csv -LiteralPath $StageManifestPath -NoTypeInformation -Encoding UTF8
+    Remove-Item -LiteralPath $SourceMissingStage,$SourceHashChanged,$SourceTargetExists,$TargetAlreadyThere -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $NegAlbum -Force -ErrorAction SilentlyContinue
 
     # Approve both and exercise same- plus cross-extension commit.
     $intake = @(Import-Csv -LiteralPath $IntakePath)

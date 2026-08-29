@@ -7,6 +7,10 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 ## [Unreleased]
 
 ### Fixed
+- Script comment-based help now appears before `#requires`, allowing `Get-Help -Full` to render the authored synopsis/description/examples instead of syntax-only fallback; the RC harness now tests this explicitly
+- Raw strict-decoder failures are now persisted/exported as `ObservedDecodeFailure` evidence rather than automatic `Needed` replacement entries
+- The old `replacement-needed.csv` output is replaced by `source-decode-observations.csv`, which explicitly records `ObservationOnly=True` and `ReplacementAuthorized=False`
+- RC regression coverage now includes missing staged files, changed staged hashes, and pre-existing cross-extension targets
 - Same-extension transactional replacement now supplies a real same-directory swap-backup path to `System.IO.File.Replace`, fixing Windows/.NET rejection of a null backup path; the temporary swap backup is removed after verification
 - RC harness now checks `SourceDecodeStatus` from `source-decode-audit.csv` instead of the nonexistent `Status` field
 - RC harness FFmpeg sine-source interpolation now uses `${Frequency}` so PowerShell does not parse `:duration` as part of the variable name
@@ -24,6 +28,9 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `v0.7-rc.2` documentation and architecture hardening pass
+- built-in PowerShell `Get-Help` documentation for the main script
+- user documentation for usage, reports, architecture, recovery, troubleshooting, and v0.7 release notes
 - `v0.7-rc.1` release-candidate hardening baseline
 - `scripts/Test-ReleaseCandidate.ps1` isolated synthetic regression harness
 - RC coverage for parser/version consistency, safe audit, strict decode reporting, downgrade refusal, same-extension replacement, cross-extension replacement, verified backups, post-verification, queue clearance, and album requalification

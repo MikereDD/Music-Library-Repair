@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--rc.1.3-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--rc.2.1-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-rc.1.3**
+> Current development baseline: **v0.7-rc.2.1**
 
 ## Core workflow
 
@@ -278,7 +278,7 @@ Existing committed transactions can also be rechecked without touching media:
 
 ### v0.7 release-candidate hardening
 
-`v0.7-rc.1.3` includes the isolated synthetic regression harness:
+`v0.7-rc.2.1` includes the isolated synthetic regression harness:
 
 ```powershell
 .\scripts\Test-ReleaseCandidate.ps1
@@ -388,3 +388,27 @@ Released under the **MIT License**.
 Copyright © 2026 **Typezer∅**.
 
 See [LICENSE.md](LICENSE.md).
+
+
+## Documentation
+
+- [`docs/USAGE.md`](docs/USAGE.md) — complete command workflow and examples
+- [`docs/REPORTS.md`](docs/REPORTS.md) — report meanings and evidence/action separation
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — canonical engine and replacement state machine
+- [`docs/RECOVERY.md`](docs/RECOVERY.md) — backup, rollback, and recovery behavior
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common diagnostics and safe responses
+- [`docs/RELEASE-CHECKLIST.md`](docs/RELEASE-CHECKLIST.md) — stable-promotion gate
+- [`docs/RELEASE-NOTES-0.7.md`](docs/RELEASE-NOTES-0.7.md) — stable milestone scope
+
+PowerShell help is also embedded in the main script:
+
+```powershell
+Get-Help .\src\Repair-MusicLibrary.ps1 -Full
+```
+
+
+
+### Decoder observations are not replacement authorization
+
+A strict decoder failure is recorded in `source-decode-observations.csv` as evidence only. The classification-aware `repair-action-queue.csv` decides whether the next action is `AudioReview`, `ContainerReview`, `RepairArtwork`, `ReplacementReview`, or another manual review. No raw audit failure silently becomes permission to replace a file.
+

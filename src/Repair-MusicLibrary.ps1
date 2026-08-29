@@ -1,3 +1,141 @@
+<#
+.SYNOPSIS
+Audits, reviews, repairs, and verifies a local music library with conservative,
+transactional safety gates.
+
+.DESCRIPTION
+Music-Library-Repair uses one canonical workflow:
+
+    Discover -> Audit -> Classify -> Review -> Plan -> Approve -> Apply -> Verify
+
+The tool does not treat every decoder diagnostic as proof that a track must be
+replaced. Full-library audit evidence is classified first. Replacement remains
+a separate, explicit review path.
+
+Destructive replacement requires:
+  - a verified staged candidate,
+  - ReplaceApproved=Yes in replacement-candidate-intake.csv,
+  - -BackupOriginals,
+  - -Yes,
+  - and, for a known lossless-to-lossy replacement,
+    QualityDowngradeApproved=Yes.
+
+Every committed replacement is backed up and hash-verified before source
+replacement. The replacement is hash-verified and strict-decoded before the
+transaction is accepted.
+
+.PARAMETER Root
+Root folder containing the music library to inspect or repair.
+
+.PARAMETER StateRoot
+Runtime state and report directory. Defaults to:
+$HOME\Downloads\Music-Library-Repair
+
+.PARAMETER AuditOnly
+Runs a non-destructive whole-library audit. Persistent repair state is not
+modified.
+
+.PARAMETER AnalyzeAuditReports
+Analyzes previously generated audit reports without modifying media.
+
+.PARAMETER RecheckAuditFailures
+Rechecks previously failed audit items.
+
+.PARAMETER AnalyzeFailureSeverity
+Measures failure severity from the generated audit evidence.
+
+.PARAMETER ClassifyAuditFailures
+Classifies audit failures into evidence/action domains.
+
+.PARAMETER ReclassifyFailureDomains
+Rebuilds PrimaryDomain independently from the broader EvidenceDomain.
+
+.PARAMETER BuildRepairQueue
+Builds the classification-aware repair-action queue. This queue, not raw decode
+failure observation, determines whether an item enters ReplacementReview,
+ContainerReview, AudioReview, or artwork repair.
+
+.PARAMETER AnalyzeReplacementReview
+Analyzes only items classified for ReplacementReview.
+
+.PARAMETER AnalyzeReplacementEvidence
+Performs targeted evidence gathering for replacement-review items.
+
+.PARAMETER ReviewReplacementCandidates
+Builds/preserves the candidate intake sheet and validates supplied candidates.
+
+.PARAMETER StageReplacementCandidates
+Copies explicitly approved candidates into isolated staging and verifies their
+hash and strict decode status. Source media is not replaced.
+
+.PARAMETER ApplyStagedReplacements
+Applies only explicitly approved, verified staged replacements. Requires
+-BackupOriginals and -Yes.
+
+.PARAMETER VerifyReplacementTransactions
+Read-only verification of previously committed replacement transactions,
+including current hash/decode state, backup integrity, queue clearance, and
+affected-album requalification.
+
+.PARAMETER BackupOriginals
+Required safety switch for destructive apply modes that support backup.
+
+.PARAMETER Yes
+Required explicit confirmation switch for destructive replacement.
+
+.PARAMETER SkipSourceDecodeAudit
+Skips the strict source decode audit where supported.
+
+.PARAMETER Resume
+Resumes interactive review state for the supplied Root.
+
+.PARAMETER ApplyApproved
+Applies previously approved metadata/artwork plans. This is separate from
+ApplyStagedReplacements.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -AuditOnly
+
+Runs a non-destructive full-library audit.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -BuildRepairQueue
+
+Builds the classification-aware repair queue from existing audit/classification
+reports.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -ReviewReplacementCandidates
+
+Creates or refreshes replacement candidate intake/validation reports.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -StageReplacementCandidates
+
+Stages only candidates with StageApproved=Yes and verifies the staged copy.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -ApplyStagedReplacements -BackupOriginals -Yes
+
+Runs the destructive replacement transaction path. Individual replacements
+still require ReplaceApproved=Yes, and known lossless-to-lossy replacements
+also require QualityDowngradeApproved=Yes.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -VerifyReplacementTransactions
+
+Performs read-only post-replacement verification.
+
+.NOTES
+Requires PowerShell 7+, ffmpeg, and ffprobe.
+
+See:
+  docs\USAGE.md
+  docs\REPORTS.md
+  docs\RECOVERY.md
+  docs\TROUBLESHOOTING.md
+  docs\ARCHITECTURE.md
+#>
 #requires -Version 7.0
 [CmdletBinding()]
 param(
@@ -29,7 +167,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-rc.1.3"
+$ToolVersion = "0.7-rc.2.1"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -161,12 +299,13 @@ function Sync-ReplacementQueue {
                 $item.FirstDetectedAt = $now
             }
 
-            # A file that is failing again must be actionable even if a prior
-            # run had marked the queue item otherwise.
+            # Raw strict-decode evidence is observation only. Replacement
+            # authorization comes later from the classification-aware repair
+            # queue (ReplacementReview), never from this persistent observation.
             if (-not $item.ContainsKey("Status") -or
                 [string]::IsNullOrWhiteSpace([string]$item.Status) -or
-                $item.Status -eq "NoLongerFailing") {
-                $item.Status = "Needed"
+                $item.Status -in @("Needed","NoLongerFailing","NoLongerObserved")) {
+                $item.Status = "ObservedDecodeFailure"
             }
         }
         else {
@@ -182,7 +321,7 @@ function Sync-ReplacementQueue {
                 Title            = $track.Title
                 DecodeExitCode   = $track.SourceDecodeExitCode
                 DecodeError      = $track.SourceDecodeError
-                Status           = "Needed"
+                Status           = "ObservedDecodeFailure"
                 CandidatePath    = $null
                 CandidateStatus  = $null
                 FirstDetectedAt  = $now
@@ -199,8 +338,8 @@ function Sync-ReplacementQueue {
         if ($item.SourcePath -and
             $item.SourcePath.StartsWith($Root, [System.StringComparison]::OrdinalIgnoreCase) -and
             -not $activePaths.ContainsKey($item.SourcePath) -and
-            $item.Status -eq "Needed") {
-            $item.Status = "NoLongerFailing"
+            $item.Status -in @("Needed","ObservedDecodeFailure")) {
+            $item.Status = "NoLongerObserved"
         }
     }
 }
@@ -216,8 +355,10 @@ function Export-ReplacementQueue {
     $rows = @(
         foreach ($item in $State.replacements.Values) {
             [pscustomobject]@{
-                Status          = $item.Status
-                SourcePath      = $item.SourcePath
+                Status                = $item.Status
+                ObservationOnly       = $true
+                ReplacementAuthorized = $false
+                SourcePath            = $item.SourcePath
                 AlbumDirectory  = $item.AlbumDirectory
                 Artist          = $item.Artist
                 Album           = $item.Album
@@ -4745,7 +4886,7 @@ $StateFile = Join-Path $StateRoot "state.json"
 $TrackReport = Join-Path $ReportRoot "tracks.csv"
 $AlbumReport = Join-Path $ReportRoot "albums.csv"
 $PlanReport = Join-Path $ReportRoot "rename-plan.csv"
-$ReplacementReport = Join-Path $ReportRoot "replacement-needed.csv"
+$ReplacementReport = Join-Path $ReportRoot "source-decode-observations.csv"
 $DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
 $AudioOnlyRecheckReport = Join-Path $ReportRoot "audio-only-recheck.csv"
 $FailureClassificationReport = Join-Path $ReportRoot "failure-classification.csv"
@@ -4909,6 +5050,10 @@ if ($AnalyzeAuditReports) {
 
     Write-Host ""
     Write-Host "No media files were decoded or modified."
+    Write-Host ""
+    Write-Host "Decode observations are evidence only; they do NOT authorize replacement."
+    Write-Host "Use -ClassifyAuditFailures / -ReclassifyFailureDomains / -BuildRepairQueue"
+    Write-Host "before deciding whether an item belongs in ReplacementReview."
     Write-Host "Persistent repair state was NOT modified."
     return
 }
@@ -5086,8 +5231,10 @@ if ($AuditOnly) {
         Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" } |
         ForEach-Object {
             [pscustomobject]@{
-                Status          = "Needed"
-                SourcePath      = $_.Path
+                Status                = "ObservedDecodeFailure"
+                ObservationOnly       = $true
+                ReplacementAuthorized = $false
+                SourcePath            = $_.Path
                 AlbumDirectory  = $_.Directory
                 Artist          = $_.Artist
                 Album           = $_.Album
@@ -5171,15 +5318,15 @@ Export-ReplacementQueue -State $state -Path $ReplacementReport
 $state.generatedAt=(Get-Date).ToString("o")
 $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StateFile -Encoding UTF8
 
-$replacementNeededCount = @(
+$decodeObservationCount = @(
     $state.replacements.Values |
-    Where-Object { $_.Status -eq "Needed" }
+    Where-Object { $_.Status -in @("Needed","ObservedDecodeFailure") }
 ).Count
 
 if ($ApplyApproved) {
-    if (-not $SkipSourceDecodeAudit -and $replacementNeededCount -gt 0) {
-        Write-Host "Replacement queue   : $replacementNeededCount needed"
-        Write-Host "Replacement report  : $ReplacementReport"
+    if (-not $SkipSourceDecodeAudit -and $decodeObservationCount -gt 0) {
+        Write-Host "Decode observations  : $decodeObservationCount observed"
+        Write-Host "Observation report   : $ReplacementReport"
         Write-Host ""
     }
     Invoke-ApprovedApply -BackupOriginals:$BackupOriginals -Yes:$Yes
@@ -5195,7 +5342,7 @@ Write-Host "  $PlanReport"
 Write-Host "  $DecodeReport"
 Write-Host "  $ReplacementReport"
 if (-not $SkipSourceDecodeAudit) {
-    Write-Host "Replacement queue   : $replacementNeededCount needed"
+    Write-Host "Decode observations  : $decodeObservationCount observed"
 }
 Write-Host ""
 

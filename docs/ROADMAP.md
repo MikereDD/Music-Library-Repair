@@ -191,3 +191,17 @@ v1.0 should not be tagged until:
 - state migration is defined
 - destructive edge cases are covered by tests
 - documentation matches actual behavior
+
+
+## v0.7-rc.2 stable hardening
+
+Implemented:
+
+- raw decoder observations separated from replacement authorization
+- built-in PowerShell help
+- stable user documentation suite
+- edge-case RC tests for missing stage, changed staged hash, and existing target
+- playlist rewriting explicitly deferred rather than left ambiguous
+- v0.7 release notes
+
+- rc.2.1 fixes comment-based help placement and adds Get-Help regression assertions
