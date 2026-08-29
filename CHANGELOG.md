@@ -7,6 +7,7 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 ## [Unreleased]
 
 ### Fixed
+- Refine dev.10 evidence labels so a missing path is `MissingSourcePath`, while an existing file that has no probe duration and no measurable tolerant decode is `UnreadableMediaSource`
 - `-ReclassifyFailureDomains` now bypasses normal ffprobe/ffmpeg preflight checks because it only reads existing CSV measurements
 - Fixes silent pre-banner exit when running the report-only reclassification mode
 - Preserve combined error evidence instead of letting `AUDIO` override simultaneous `CONTAINER` or `ARTWORK` evidence
@@ -16,6 +17,12 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `-AnalyzeReplacementEvidence` targeted diagnostic mode for the dev.9 `NeedsMoreEvidence` subset
+- Fresh ffprobe duration retrieval and tolerant audio decoding only for unresolved replacement-review items
+- `replacement-evidence-analysis.csv` with evidence resolution, replacement confidence, probe status, targeted decode status, original/targeted signatures, durations, completion percentage, and identity context
+- `replacement-evidence-summary.csv` grouped by evidence resolution, confidence, probe/decode status, signatures, and extension
+- Evidence resolutions for confirmed severe loss, container/header failure, unavailable probe duration, successful decode with unknown duration, unreadable source, and manual inspection
+- Explicit rule that even high replacement confidence remains review-only and never authorizes replacement
 - `-AnalyzeReplacementReview` report-only mode for the `ReplacementReview` subset
 - `replacement-review-analysis.csv` with review priority, evidence assessment, completion band, signature, format, and track identity context
 - `replacement-review-summary.csv` grouped by priority, evidence assessment, completion band, severity, signature, and extension

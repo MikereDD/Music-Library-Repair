@@ -25,9 +25,17 @@ Implemented in `v0.7-dev.9`:
 - priority bands for severe review items
 - signature/format/album identity context before candidate sourcing
 
+Implemented in `v0.7-dev.10`:
+
+- targeted `-AnalyzeReplacementEvidence` pass for `NeedsMoreEvidence`
+- fresh ffprobe duration evidence only for unresolved review items
+- tolerant diagnostic decode only for unresolved review items
+- evidence-resolution and confidence reports before candidate sourcing
+- dev.10.1 distinguishes missing paths from present-but-unreadable media sources
+
 Next:
 
-- inspect and validate the dev.9 ReplacementReview breakdown
+- inspect and validate the dev.10 replacement-evidence breakdown
 - interactive replacement-candidate selection
 - strict candidate decode
 - duration/identity checks

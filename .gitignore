@@ -21,6 +21,12 @@ failure-classification.csv
 failure-classification-summary.csv
 failure-classification-reclassified.csv
 failure-classification-reclassified-summary.csv
+repair-action-queue.csv
+repair-action-queue-summary.csv
+replacement-review-analysis.csv
+replacement-review-summary.csv
+replacement-evidence-analysis.csv
+replacement-evidence-summary.csv
 *-audit.csv
 cover-cache/
 Backups/

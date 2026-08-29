@@ -17,6 +17,7 @@ param(
     [switch]$ReclassifyFailureDomains,
     [switch]$BuildRepairQueue,
     [switch]$AnalyzeReplacementReview,
+    [switch]$AnalyzeReplacementEvidence,
     [ValidateRange(1,50)]
     [int]$FailureSamplesPerSignature = 5
 )
@@ -24,7 +25,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.9"
+$ToolVersion = "0.7-dev.10.1"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -533,6 +534,211 @@ function Invoke-AnalyzeReplacementReview {
     Write-Host "No media files were modified."
     Write-Host "Persistent repair state was NOT modified."
     Write-Host "This analysis prioritizes review evidence only; it does NOT authorize replacement."
+}
+
+
+function Invoke-AnalyzeReplacementEvidence {
+    param(
+        [Parameter(Mandatory)][string]$ReplacementReviewAnalysisPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $ReplacementReviewAnalysisPath -PathType Leaf)) {
+        throw "Replacement-review analysis not found: $ReplacementReviewAnalysisPath`nRun -AnalyzeReplacementReview first."
+    }
+
+    $sourceRows = @(
+        Import-Csv -LiteralPath $ReplacementReviewAnalysisPath |
+        Where-Object { $_.EvidenceAssessment -eq "NeedsMoreEvidence" }
+    )
+
+    if ($sourceRows.Count -eq 0) {
+        Write-Host "No NeedsMoreEvidence replacement-review items remain."
+        return
+    }
+
+    $detailPath = Join-Path $OutputRoot "replacement-evidence-analysis.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-evidence-summary.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    $index = 0
+    foreach ($row in $sourceRows) {
+        $index++
+        $path = [string]$row.SourcePath
+        Write-Host ("[{0}/{1}] {2}" -f $index,$sourceRows.Count,$path)
+
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                EvidenceResolution       = "MissingSourcePath"
+                ReplacementConfidence    = "High"
+                ProbeStatus              = "Missing"
+                TargetedDecodeStatus     = "NotRun"
+                OriginalSignature        = $row.Signature
+                TargetedSignature        = $null
+                Extension                = $row.Extension
+                SourcePath               = $path
+                AlbumDirectory           = $row.AlbumDirectory
+                Artist                   = $row.Artist
+                AlbumArtist              = $row.AlbumArtist
+                Album                    = $row.Album
+                Date                     = $row.Date
+                Disc                     = $row.Disc
+                Track                    = $row.Track
+                Title                    = $row.Title
+                ReportedDurationSeconds  = $null
+                DecodedDurationSeconds   = $null
+                DecodedPercent           = $null
+                TolerantExitCode         = $null
+                DiagnosticNote           = "Source path is missing."
+            })
+            continue
+        }
+
+        $reported = Get-ReportedAudioDurationSeconds -Path $path
+        $diag = Invoke-TolerantAudioDecodeDiagnostic -Path $path
+        $decoded = [double]$diag.DecodedSeconds
+
+        $percent = $null
+        if ($null -ne $reported -and [double]$reported -gt 0) {
+            $percent = [math]::Round((100.0 * $decoded / [double]$reported), 3)
+        }
+
+        $probeStatus = if ($null -eq $reported) { "DurationUnavailable" } else { "DurationAvailable" }
+        $decodeStatus = if ([int]$diag.ExitCode -eq 0) { "Completed" } else { "Error" }
+
+        $originalSignature = [string]$row.Signature
+        $targetedSignature = [string]$diag.ErrorSignature
+        $looksLikeContainerOrHeader = (
+            $originalSignature -like "Container:*" -or
+            $originalSignature -eq "MP3 audio: header missing" -or
+            $targetedSignature -like "Container:*" -or
+            $targetedSignature -eq "MP3 audio: header missing"
+        )
+
+        $resolution = "NeedsManualInspection"
+        $confidence = "Low"
+        $note = "Targeted evidence remains ambiguous."
+
+        if ($null -eq $reported) {
+            if ([int]$diag.ExitCode -eq 0 -and $decoded -gt 0) {
+                $resolution = "AudioDecodesButDurationUnknown"
+                $confidence = "Low"
+                $note = "Audio completed a tolerant decode, but ffprobe could not supply duration."
+            }
+            elseif ($decoded -le 0) {
+                $resolution = "UnreadableMediaSource"
+                $confidence = "High"
+                $note = "Source exists, but ffprobe cannot determine duration and tolerant decode cannot recover measurable audio."
+            }
+            elseif ($looksLikeContainerOrHeader) {
+                $resolution = "ContainerOrHeaderFailure"
+                $confidence = "Medium"
+                $note = "Some audio decoded, but container/header diagnostics prevent a trustworthy duration comparison."
+            }
+            else {
+                $resolution = "ProbeDurationUnavailable"
+                $confidence = "Low"
+                $note = "ffprobe duration is unavailable and the targeted decode still returned an error."
+            }
+        }
+        else {
+            if ($null -ne $percent -and $percent -lt 95.0) {
+                $resolution = "ConfirmedSevereAudioDamage"
+                $confidence = "High"
+                $note = "Targeted tolerant decode recovered less than 95% of the reported duration."
+            }
+            elseif ($looksLikeContainerOrHeader -and [int]$diag.ExitCode -ne 0) {
+                $resolution = "ContainerOrHeaderFailure"
+                $confidence = "Medium"
+                $note = "Most audio is recoverable, but container/header diagnostics remain."
+            }
+            elseif ([int]$diag.ExitCode -eq 0 -and $null -ne $percent -and $percent -ge 99.9) {
+                $resolution = "NeedsManualInspection"
+                $confidence = "Low"
+                $note = "Targeted tolerant decode now completes essentially the full reported duration."
+            }
+        }
+
+        $results.Add([pscustomobject]@{
+            EvidenceResolution       = $resolution
+            ReplacementConfidence    = $confidence
+            ProbeStatus              = $probeStatus
+            TargetedDecodeStatus     = $decodeStatus
+            OriginalSignature        = $originalSignature
+            TargetedSignature        = $targetedSignature
+            Extension                = $row.Extension
+            SourcePath               = $path
+            AlbumDirectory           = $row.AlbumDirectory
+            Artist                   = $row.Artist
+            AlbumArtist              = $row.AlbumArtist
+            Album                    = $row.Album
+            Date                     = $row.Date
+            Disc                     = $row.Disc
+            Track                    = $row.Track
+            Title                    = $row.Title
+            ReportedDurationSeconds  = $reported
+            DecodedDurationSeconds   = $decoded
+            DecodedPercent           = $percent
+            TolerantExitCode         = $diag.ExitCode
+            DiagnosticNote           = $note
+        })
+    }
+
+    $results |
+        Sort-Object EvidenceResolution, ReplacementConfidence, AlbumDirectory, Disc, Track, SourcePath |
+        Export-Csv -LiteralPath $detailPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($category in @(
+        "EvidenceResolution",
+        "ReplacementConfidence",
+        "ProbeStatus",
+        "TargetedDecodeStatus",
+        "OriginalSignature",
+        "TargetedSignature",
+        "Extension"
+    )) {
+        foreach ($group in ($results | Group-Object $category | Sort-Object Count -Descending)) {
+            $summary.Add([pscustomobject]@{
+                Category = $category
+                Name     = $group.Name
+                Count    = $group.Count
+            })
+        }
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT EVIDENCE ANALYSIS"
+    Write-Host ("=" * 72)
+    Write-Host "Input : $ReplacementReviewAnalysisPath"
+    Write-Host "Items : $($results.Count)"
+
+    Write-Host ""
+    Write-Host "Evidence resolution:"
+    foreach ($group in ($results | Group-Object EvidenceResolution | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-38} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Replacement confidence:"
+    foreach ($group in ($results | Group-Object ReplacementConfidence | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-20} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $detailPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "Only the NeedsMoreEvidence subset was targeted."
+    Write-Host "Audio was decoded for diagnosis only."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "High replacement confidence still means review; it does NOT authorize replacement."
 }
 
 
@@ -2768,19 +2974,20 @@ $exclusiveModes = @(
         [bool]$ReclassifyFailureDomains,
         [bool]$BuildRepairQueue,
         [bool]$AnalyzeReplacementReview,
+        [bool]$AnalyzeReplacementEvidence,
         [bool]$ApplyApproved
     ) | Where-Object { $_ }
 )
 
 if ($exclusiveModes.Count -gt 1) {
-    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, and -ApplyApproved are mutually exclusive modes."
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, and -ApplyApproved are mutually exclusive modes."
 }
 
 if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not $BuildRepairQueue -and -not $AnalyzeReplacementReview -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
-if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     throw "ffmpeg was not found in PATH."
 }
 if (($AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
@@ -2791,7 +2998,7 @@ New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
 # Audit/report-analysis output is intentionally isolated from persistent repair
 # state so whole-library analysis cannot overwrite an in-progress review.
-$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview) { Join-Path $StateRoot "audit" } else { $StateRoot }
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -2804,12 +3011,16 @@ $AudioOnlyRecheckReport = Join-Path $ReportRoot "audio-only-recheck.csv"
 $FailureClassificationReport = Join-Path $ReportRoot "failure-classification.csv"
 $FailureReclassifiedReport = Join-Path $ReportRoot "failure-classification-reclassified.csv"
 $RepairActionQueueReport = Join-Path $ReportRoot "repair-action-queue.csv"
+$ReplacementReviewAnalysisReport = Join-Path $ReportRoot "replacement-review-analysis.csv"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($AnalyzeReplacementEvidence) {
+    "ANALYZE REPLACEMENT EVIDENCE"
 }
 elseif ($AnalyzeReplacementReview) {
     "ANALYZE REPLACEMENT REVIEW"
@@ -2840,6 +3051,13 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($AnalyzeReplacementEvidence) {
+    Invoke-AnalyzeReplacementEvidence `
+        -ReplacementReviewAnalysisPath $ReplacementReviewAnalysisReport `
+        -OutputRoot $ReportRoot
+    return
+}
 
 if ($AnalyzeReplacementReview) {
     Invoke-AnalyzeReplacementReview `
@@ -3343,4 +3561,3 @@ for ($a=0; $a -lt $albums.Count; $a++) {
 Write-Host ""
 Write-Host "Review complete."
 Write-Host "State: $StateFile"
-
