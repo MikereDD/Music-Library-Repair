@@ -9,6 +9,15 @@ Implemented in `v0.7-dev.1`:
 - first/last detection timestamps
 - queue history preservation across rescans
 
+Implemented in `v0.7-dev.8`:
+
+- report-only `-BuildRepairQueue`
+- actionable `repair-action-queue.csv`
+- `repair-action-queue-summary.csv`
+- queue grouping by disposition, status, primary domain, and severity
+- metadata enrichment from the existing audit track report
+- explicit non-destructive `ReplacementReview` state
+
 Next:
 
 - interactive replacement-candidate selection
@@ -36,6 +45,7 @@ Next:
 - [x] separate primary failure domain from secondary evidence domains
 - [x] reclassify existing full-audit measurements without repeat decoding
 - [x] make report-only reclassification independent of ffmpeg/ffprobe preflight
+- [x] build a report-only actionable repair queue from validated classification
 - missing-track / track-number gap detector
 - disc-aware gap detection
 - authoritative MusicBrainz tracklist comparison

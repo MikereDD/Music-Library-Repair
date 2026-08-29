@@ -16,6 +16,12 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `-BuildRepairQueue` report-only mode
+- `repair-action-queue.csv` generated from the newest available reclassified/full failure classification
+- `repair-action-queue-summary.csv` grouped by action, queue status, primary domain, and severity
+- Audit `tracks.csv` metadata enrichment for repair-queue rows when available
+- Queue statuses for audio review, container review, artwork repair, replacement review, missing-file lookup, and manual review
+- Explicit guarantee that `ReplacementReview` is non-destructive review state and does not authorize replacement
 - `-ReclassifyFailureDomains` mode that reuses existing full-classification measurements without re-decoding audio
 - Separate `PrimaryDomain` and `EvidenceDomain` fields
 - Primary domain is derived from the canonical signature and drives disposition
@@ -54,8 +60,10 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Existing future replacement fields are preserved across rescans
 
 ### Planned
-- Replacement queue for known-bad source audio
+- Verified replacement candidate selection and strict candidate decode
+- Duration/identity validation before staging
 - Verified replacement staging and transactional swap
+- Album re-audit after replacement
 - Missing-track / track-gap detection
 - MusicBrainz media breakdown instead of raw aggregate track count
 - Better title verification against authoritative tracklists

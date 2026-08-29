@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.7.2-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.8-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.7.2**
+> Current development baseline: **v0.7-dev.8**
 
 ## Core workflow
 
@@ -72,6 +72,7 @@ Ambiguity is surfaced. Damaged source audio is blocked. Artwork errors stay artw
 - Optional original backups
 - Post-write metadata, artwork, and strict-decode verification
 - Failure-domain classification for audio, artwork, and container problems
+- Report-only repair action queue generated from validated classification
 - Replacement-review queue foundation for genuinely bad source media
 
 ## Canonical filenames
@@ -175,6 +176,23 @@ Reclassify existing measurements without decoding again:
     -ReclassifyFailureDomains
 ```
 
+Build the report-only repair action queue from the newest available failure classification:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -BuildRepairQueue
+```
+
+`-BuildRepairQueue` writes:
+
+```text
+repair-action-queue.csv
+repair-action-queue-summary.csv
+```
+
+It does not decode audio, modify media, or change persistent repair state. `ReplacementReview` is a review state only; it does **not** authorize replacement.
+
 ## Failure-domain model
 
 The classifier separates the primary problem from all FFmpeg evidence.
@@ -198,6 +216,23 @@ EvidenceDomain
 
 Disposition is driven by **PrimaryDomain + decoded completion**, while secondary evidence remains available for diagnostics.
 
+## Repair action queue
+
+The report-only queue converts validated diagnostics into actionable review categories without treating every FFmpeg failure as a replacement case.
+
+Current queue statuses include:
+
+```text
+PendingAudioReview
+PendingContainerReview
+PendingArtworkRepair
+PendingReplacementReview
+PendingLocateFile
+PendingManualReview
+```
+
+When `audit\tracks.csv` is available, album and track metadata are joined back into queue rows so review can happen with useful identity context.
+
 ## Safety model
 
 | Condition | Meaning | Default behavior |
@@ -206,7 +241,7 @@ Disposition is driven by **PrimaryDomain + decoded completion**, while secondary
 | Artwork problem | Cover data is malformed or missing | Repair artwork, preserve audio |
 | Container problem | Wrapper/input structure needs review | Review before rewriting |
 | Audio problem | Decoder reports audio-specific faults | Review severity |
-| Replacement candidate | Audio cannot be trusted safely | Block and queue |
+| Replacement candidate | Audio cannot be trusted safely | Block and queue for review |
 | Missing track | Expected album content is absent | Do not guess |
 | Ambiguous release | Exact release cannot be identified safely | Require review |
 
@@ -233,6 +268,7 @@ Generated reports may contain local paths and are intentionally excluded from ve
 
 - Apply/rewrite mode is deliberately **MP3-only**.
 - FLAC/M4A transactional apply support remains roadmap work.
+- `-BuildRepairQueue` is report-only; candidate validation and replacement execution are not implemented yet.
 - The source-replacement workflow is under active development.
 - Pre-1.0 builds should be used with `-BackupOriginals` and an independent library backup.
 
@@ -240,9 +276,9 @@ Generated reports may contain local paths and are intentionally excluded from ve
 
 The v0.6 engine established the safe transactional repair foundation.
 
-The v0.7 development branch now includes replacement-needed persistence, read-only whole-library auditing, targeted failure rechecks, canonical FFmpeg signatures, primary vs evidence domains, tolerant decode severity measurement, full failure classification, and report-only reclassification.
+The v0.7 development branch now includes replacement-needed persistence, read-only whole-library auditing, targeted failure rechecks, canonical FFmpeg signatures, primary vs evidence domains, tolerant decode severity measurement, full failure classification, report-only reclassification, and a report-only repair action queue.
 
-The next major step is verified replacement candidate selection, staging, transactional swap, rollback, and album re-audit.
+The next major step is verified replacement candidate selection, strict candidate validation, staging, transactional swap, rollback, and album re-audit.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) and [CHANGELOG.md](CHANGELOG.md).
 
