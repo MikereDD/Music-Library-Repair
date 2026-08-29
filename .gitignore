@@ -27,6 +27,9 @@ replacement-review-analysis.csv
 replacement-review-summary.csv
 replacement-evidence-analysis.csv
 replacement-evidence-summary.csv
+replacement-candidate-intake.csv
+replacement-candidate-validation.csv
+replacement-candidate-summary.csv
 *-audit.csv
 cover-cache/
 Backups/

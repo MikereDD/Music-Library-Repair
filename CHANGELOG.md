@@ -7,6 +7,10 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 ## [Unreleased]
 
 ### Fixed
+- Add conservative `.mp3` forced-demuxer fallback when normal ffprobe detection fails
+- Preserve normal probe failure separately from forced probe/decode evidence
+- Classify successful fallback candidates as `CandidateForcedDemuxerReview` rather than generic probe failure or normal validation
+- Record `ForcedDemuxer`, `ForcedProbeStatus`, `ForcedDecodeStatus`, and `NormalProbeError` in candidate validation output
 - Refine dev.10 evidence labels so a missing path is `MissingSourcePath`, while an existing file that has no probe duration and no measurable tolerant decode is `UnreadableMediaSource`
 - `-ReclassifyFailureDomains` now bypasses normal ffprobe/ffmpeg preflight checks because it only reads existing CSV measurements
 - Fixes silent pre-banner exit when running the report-only reclassification mode
@@ -17,6 +21,13 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `-ReviewReplacementCandidates` non-destructive candidate-intake and validation mode
+- `replacement-candidate-intake.csv` for assigning local candidate paths to high-confidence `UnreadableMediaSource` items
+- Candidate intake preserves assigned paths and review notes across reruns
+- `replacement-candidate-validation.csv` with ffprobe, strict-decode, duration, identity score, identity conflicts, and expected-vs-candidate metadata
+- `replacement-candidate-summary.csv` with candidate and strict-decode status counts
+- Conservative candidate states including missing, unsupported, probe-failed, strict-decode-failed, duration-unavailable, identity-conflict, identity-review, and validated-for-review
+- `CandidateValidatedForReview` explicitly remains non-authorizing: no staging, swap, source modification, or persistent repair-state update occurs in dev.11
 - `-AnalyzeReplacementEvidence` targeted diagnostic mode for the dev.9 `NeedsMoreEvidence` subset
 - Fresh ffprobe duration retrieval and tolerant audio decoding only for unresolved replacement-review items
 - `replacement-evidence-analysis.csv` with evidence resolution, replacement confidence, probe status, targeted decode status, original/targeted signatures, durations, completion percentage, and identity context

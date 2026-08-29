@@ -33,12 +33,22 @@ Implemented in `v0.7-dev.10`:
 - evidence-resolution and confidence reports before candidate sourcing
 - dev.10.1 distinguishes missing paths from present-but-unreadable media sources
 
+Implemented in `v0.7-dev.11`:
+
+- non-destructive `-ReviewReplacementCandidates`
+- persistent CSV intake for local candidate paths
+- ffprobe readability validation
+- strict candidate decode validation
+- candidate duration readability check
+- conservative expected-vs-candidate identity scoring and conflict detection
+- validated-for-review status without staging or replacement authority
+- dev.11.1 conservative forced-MP3 demuxer fallback with explicit review-only status when automatic probing misdetects a candidate
+
 Next:
 
-- inspect and validate the dev.10 replacement-evidence breakdown
-- interactive replacement-candidate selection
-- strict candidate decode
-- duration/identity checks
+- exercise dev.11 candidate intake against known clean local replacement files
+- improve authoritative duration/identity verification where source duration is unavailable
+- interactive/assisted candidate discovery
 - transactional replacement
 - album re-audit after replacement
 - preserve unresolved items across runs

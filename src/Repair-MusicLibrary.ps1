@@ -18,6 +18,7 @@ param(
     [switch]$BuildRepairQueue,
     [switch]$AnalyzeReplacementReview,
     [switch]$AnalyzeReplacementEvidence,
+    [switch]$ReviewReplacementCandidates,
     [ValidateRange(1,50)]
     [int]$FailureSamplesPerSignature = 5
 )
@@ -25,7 +26,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.10.1"
+$ToolVersion = "0.7-dev.11.1"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -739,6 +740,583 @@ function Invoke-AnalyzeReplacementEvidence {
     Write-Host "No media files were modified."
     Write-Host "Persistent repair state was NOT modified."
     Write-Host "High replacement confidence still means review; it does NOT authorize replacement."
+}
+
+
+function Get-CandidateForcedDemuxer {
+    param([Parameter(Mandatory)][System.IO.FileInfo]$File)
+
+    switch ($File.Extension.ToLowerInvariant()) {
+        ".mp3" { return "mp3" }
+        default { return $null }
+    }
+}
+
+function Get-FFProbeInfoForced {
+    param(
+        [Parameter(Mandatory)][System.IO.FileInfo]$File,
+        [Parameter(Mandatory)][string]$Demuxer
+    )
+
+    try {
+        $text = @(
+            & ffprobe -v quiet -f $Demuxer -print_format json -show_format -show_streams -- $File.FullName
+        )
+        if ($LASTEXITCODE -ne 0 -or -not $text) {
+            throw "forced ffprobe ($Demuxer) failed with exit code $LASTEXITCODE"
+        }
+
+        $json = ($text -join [Environment]::NewLine) | ConvertFrom-Json
+        $tags = $json.format.tags
+        $embedded = @($json.streams | Where-Object {
+            $_.codec_type -eq "video" -and
+            $null -ne $_.disposition -and
+            $_.disposition.attached_pic -eq 1
+        })
+
+        $duration = $null
+        $parsedDuration = 0.0
+        if ($json.format -and
+            -not [string]::IsNullOrWhiteSpace([string]$json.format.duration) -and
+            [double]::TryParse(
+                [string]$json.format.duration,
+                [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsedDuration
+            )) {
+            $duration = $parsedDuration
+        }
+
+        [pscustomobject]@{
+            Path=$File.FullName
+            Directory=$File.DirectoryName
+            FileName=$File.Name
+            Extension=$File.Extension.ToLowerInvariant()
+            Title=(Get-TagValue $tags @("title"))
+            Artist=(Get-TagValue $tags @("artist"))
+            AlbumArtist=(Get-TagValue $tags @("album_artist","albumartist","album artist"))
+            Album=(Get-TagValue $tags @("album"))
+            TrackRaw=(Get-TagValue $tags @("track"))
+            Track=(Get-NumberPart (Get-TagValue $tags @("track")))
+            DiscRaw=(Get-TagValue $tags @("disc","discnumber"))
+            Disc=(Get-NumberPart (Get-TagValue $tags @("disc","discnumber")))
+            Date=(Get-TagValue $tags @("date","year"))
+            Genre=(Get-TagValue $tags @("genre"))
+            EmbeddedCover=($embedded.Count -gt 0)
+            CoverCount=$embedded.Count
+            DurationSeconds=$duration
+            ForcedDemuxer=$Demuxer
+            ProbeError=$null
+        }
+    }
+    catch {
+        [pscustomobject]@{
+            Path=$File.FullName; Directory=$File.DirectoryName; FileName=$File.Name; Extension=$File.Extension.ToLowerInvariant()
+            Title=$null; Artist=$null; AlbumArtist=$null; Album=$null; TrackRaw=$null; Track=$null; DiscRaw=$null; Disc=$null
+            Date=$null; Genre=$null; EmbeddedCover=$false; CoverCount=0; DurationSeconds=$null
+            ForcedDemuxer=$Demuxer; ProbeError=$_.Exception.Message
+        }
+    }
+}
+
+function Test-CandidateAudioDecodeForced {
+    param(
+        [Parameter(Mandatory)][System.IO.FileInfo]$File,
+        [Parameter(Mandatory)][string]$Demuxer
+    )
+
+    $output = @(
+        & ffmpeg -hide_banner -v error -xerror -err_detect explode `
+            -f $Demuxer -i $File.FullName `
+            -map 0:a:0 -vn -sn -dn -f null - 2>&1
+    )
+
+    $exit = $LASTEXITCODE
+
+    [pscustomobject]@{
+        Clean         = ($exit -eq 0 -and $output.Count -eq 0)
+        ExitCode      = $exit
+        ErrorText     = ($output -join " | ")
+        ForcedDemuxer = $Demuxer
+    }
+}
+
+function ConvertTo-IdentityKey {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    $s = $Value.Normalize([Text.NormalizationForm]::FormD)
+    $chars = foreach ($c in $s.ToCharArray()) {
+        $category = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($c)
+        if ($category -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            $c
+        }
+    }
+
+    $s = (-join $chars).Normalize([Text.NormalizationForm]::FormC).ToLowerInvariant()
+    $s = $s -replace '&', ' and '
+    $s = $s -replace '[^a-z0-9]+', ' '
+    $s = $s -replace '\s+', ' '
+    return $s.Trim()
+}
+
+function Invoke-ReviewReplacementCandidates {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceAnalysisPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $EvidenceAnalysisPath -PathType Leaf)) {
+        throw "Replacement evidence analysis not found: $EvidenceAnalysisPath`nRun -AnalyzeReplacementEvidence first."
+    }
+
+    $eligible = @(
+        Import-Csv -LiteralPath $EvidenceAnalysisPath |
+        Where-Object {
+            $_.EvidenceResolution -eq "UnreadableMediaSource" -and
+            $_.ReplacementConfidence -eq "High"
+        }
+    )
+
+    if ($eligible.Count -eq 0) {
+        Write-Host "No high-confidence UnreadableMediaSource items are available for candidate review."
+        return
+    }
+
+    $intakePath = Join-Path $OutputRoot "replacement-candidate-intake.csv"
+    $validationPath = Join-Path $OutputRoot "replacement-candidate-validation.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-candidate-summary.csv"
+
+    $existingBySource = @{}
+    if (Test-Path -LiteralPath $intakePath -PathType Leaf) {
+        foreach ($item in @(Import-Csv -LiteralPath $intakePath)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$item.SourcePath)) {
+                $existingBySource[[string]$item.SourcePath] = $item
+            }
+        }
+    }
+
+    $intake = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in $eligible) {
+        $existing = if ($existingBySource.ContainsKey([string]$row.SourcePath)) {
+            $existingBySource[[string]$row.SourcePath]
+        } else {
+            $null
+        }
+
+        $intake.Add([pscustomobject]@{
+            CandidateStatus = if ($existing -and $existing.CandidateStatus) { $existing.CandidateStatus } else { "AwaitingCandidate" }
+            SourcePath      = $row.SourcePath
+            AlbumDirectory = $row.AlbumDirectory
+            Artist         = $row.Artist
+            AlbumArtist    = $row.AlbumArtist
+            Album          = $row.Album
+            Date           = $row.Date
+            Disc           = $row.Disc
+            Track          = $row.Track
+            Title          = $row.Title
+            Extension      = $row.Extension
+            CandidatePath  = if ($existing) { $existing.CandidatePath } else { $null }
+            ReviewNotes    = if ($existing) { $existing.ReviewNotes } else { $null }
+        })
+    }
+
+    $validations = [System.Collections.Generic.List[object]]::new()
+    $withCandidate = @(
+        $intake | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_.CandidatePath)
+        }
+    )
+
+    foreach ($item in $withCandidate) {
+        $candidatePath = [Environment]::ExpandEnvironmentVariables([string]$item.CandidatePath)
+        $candidatePath = $candidatePath.Trim()
+
+        $status = "CandidateNeedsIdentityReview"
+        $probeStatus = "NotRun"
+        $strictDecodeStatus = "NotRun"
+        $durationStatus = "NotRun"
+        $durationSeconds = $null
+        $candidateTitle = $null
+        $candidateArtist = $null
+        $candidateAlbum = $null
+        $candidateTrack = $null
+        $candidateDisc = $null
+        $titleMatch = $false
+        $artistMatch = $false
+        $albumMatch = $false
+        $trackMatch = $false
+        $discMatch = $false
+        $identityScore = 0
+        $identityMax = 0
+        $identityConflicts = [System.Collections.Generic.List[string]]::new()
+        $strictError = $null
+        $normalProbeError = $null
+        $forcedDemuxer = $null
+        $forcedProbeStatus = "NotRun"
+        $forcedDecodeStatus = "NotRun"
+        $usedForcedDemuxer = $false
+
+        if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+            $status = "CandidateMissing"
+        }
+        elseif ([string]::Equals(
+            (Resolve-Path -LiteralPath $candidatePath).Path,
+            (Resolve-Path -LiteralPath ([string]$item.SourcePath)).Path,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            $status = "CandidateIsSource"
+        }
+        else {
+            $candidateFile = Get-Item -LiteralPath $candidatePath
+            if ($AudioExtensions -notcontains $candidateFile.Extension.ToLowerInvariant()) {
+                $status = "CandidateUnsupportedFormat"
+            }
+            else {
+                $probe = Get-FFProbeInfo -File $candidateFile
+                if ($probe.ProbeError) {
+                    $probeStatus = "Failed"
+                    $normalProbeError = $probe.ProbeError
+                    $forcedDemuxer = Get-CandidateForcedDemuxer -File $candidateFile
+
+                    if ($forcedDemuxer) {
+                        $forcedProbe = Get-FFProbeInfoForced -File $candidateFile -Demuxer $forcedDemuxer
+                        if (-not $forcedProbe.ProbeError) {
+                            $forcedProbeStatus = "Pass"
+                            $probe = $forcedProbe
+                            $usedForcedDemuxer = $true
+
+                            $candidateTitle = $probe.Title
+                            $candidateArtist = $probe.Artist
+                            $candidateAlbum = $probe.Album
+                            $candidateTrack = $probe.Track
+                            $candidateDisc = $probe.Disc
+
+                            $forcedStrict = Test-CandidateAudioDecodeForced -File $candidateFile -Demuxer $forcedDemuxer
+                            if ($forcedStrict.Clean) {
+                                $forcedDecodeStatus = "Pass"
+                                $strictDecodeStatus = "PassForced"
+                                $durationSeconds = $probe.DurationSeconds
+
+                                if ($null -eq $durationSeconds -or [double]$durationSeconds -le 0) {
+                                    $durationStatus = "Unavailable"
+                                    $status = "CandidateForcedDemuxerDurationUnavailable"
+                                }
+                                else {
+                                    $durationStatus = "ReadableForced"
+                                    $status = "CandidateForcedDemuxerReview"
+                                }
+                            }
+                            else {
+                                $forcedDecodeStatus = "Failed"
+                                $strictDecodeStatus = "FailedForced"
+                                $status = "CandidateForcedDemuxerDecodeFailed"
+                                $strictError = $forcedStrict.ErrorText
+                            }
+                        }
+                        else {
+                            $forcedProbeStatus = "Failed"
+                            $status = "CandidateProbeFailed"
+                            $strictError = $forcedProbe.ProbeError
+                        }
+                    }
+                    else {
+                        $status = "CandidateProbeFailed"
+                        $strictError = $probe.ProbeError
+                    }
+                }
+                else {
+                    $probeStatus = "Pass"
+                    $candidateTitle = $probe.Title
+                    $candidateArtist = $probe.Artist
+                    $candidateAlbum = $probe.Album
+                    $candidateTrack = $probe.Track
+                    $candidateDisc = $probe.Disc
+
+                    $strict = Test-SourceAudioDecode -File $candidateFile
+                    if (-not $strict.Clean) {
+                        $strictDecodeStatus = "Failed"
+                        $status = "CandidateStrictDecodeFailed"
+                        $strictError = $strict.ErrorText
+                    }
+                    else {
+                        $strictDecodeStatus = "Pass"
+                        $durationSeconds = Get-ReportedAudioDurationSeconds -Path $candidateFile.FullName
+                        if ($null -eq $durationSeconds -or [double]$durationSeconds -le 0) {
+                            $durationStatus = "Unavailable"
+                            $status = "CandidateDurationUnavailable"
+                        }
+                        else {
+                            $durationStatus = "Readable"
+
+                            $expectedTitle = ConvertTo-IdentityKey ([string]$item.Title)
+                            $actualTitle = ConvertTo-IdentityKey ([string]$probe.Title)
+                            if ($expectedTitle) {
+                                $identityMax += 4
+                                if ($actualTitle -and $actualTitle -eq $expectedTitle) {
+                                    $identityScore += 4
+                                    $titleMatch = $true
+                                }
+                                elseif ($actualTitle) {
+                                    $identityConflicts.Add("Title")
+                                }
+                            }
+
+                            $expectedArtist = ConvertTo-IdentityKey ([string]$item.Artist)
+                            $actualArtist = ConvertTo-IdentityKey ([string]$probe.Artist)
+                            if ($expectedArtist) {
+                                $identityMax += 3
+                                if ($actualArtist -and $actualArtist -eq $expectedArtist) {
+                                    $identityScore += 3
+                                    $artistMatch = $true
+                                }
+                                elseif ($actualArtist) {
+                                    $identityConflicts.Add("Artist")
+                                }
+                            }
+
+                            $expectedAlbum = ConvertTo-IdentityKey ([string]$item.Album)
+                            $actualAlbum = ConvertTo-IdentityKey ([string]$probe.Album)
+                            if ($expectedAlbum) {
+                                $identityMax += 2
+                                if ($actualAlbum -and $actualAlbum -eq $expectedAlbum) {
+                                    $identityScore += 2
+                                    $albumMatch = $true
+                                }
+                                elseif ($actualAlbum) {
+                                    $identityConflicts.Add("Album")
+                                }
+                            }
+
+                            $expectedTrack = 0
+                            $actualTrack = 0
+                            if ([int]::TryParse([string]$item.Track, [ref]$expectedTrack)) {
+                                $identityMax += 1
+                                if ([int]::TryParse([string]$probe.Track, [ref]$actualTrack) -and $actualTrack -eq $expectedTrack) {
+                                    $identityScore += 1
+                                    $trackMatch = $true
+                                }
+                                elseif ($null -ne $probe.Track) {
+                                    $identityConflicts.Add("Track")
+                                }
+                            }
+
+                            $expectedDisc = 0
+                            $actualDisc = 0
+                            if ([int]::TryParse([string]$item.Disc, [ref]$expectedDisc)) {
+                                $identityMax += 1
+                                if ([int]::TryParse([string]$probe.Disc, [ref]$actualDisc) -and $actualDisc -eq $expectedDisc) {
+                                    $identityScore += 1
+                                    $discMatch = $true
+                                }
+                                elseif ($null -ne $probe.Disc) {
+                                    $identityConflicts.Add("Disc")
+                                }
+                            }
+
+                            $hardConflict = (
+                                $identityConflicts.Contains("Title") -or
+                                ($identityConflicts.Contains("Artist") -and -not $albumMatch)
+                            )
+
+                            if ($usedForcedDemuxer) {
+                                if ($hardConflict) {
+                                    $status = "CandidateForcedDemuxerIdentityConflict"
+                                }
+                                else {
+                                    $status = "CandidateForcedDemuxerReview"
+                                }
+                            }
+                            elseif ($hardConflict) {
+                                $status = "CandidateIdentityConflict"
+                            }
+                            elseif ($titleMatch -and ($artistMatch -or $albumMatch)) {
+                                $status = "CandidateValidatedForReview"
+                            }
+                            else {
+                                $status = "CandidateNeedsIdentityReview"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($usedForcedDemuxer -and $forcedDecodeStatus -eq "Pass" -and $durationStatus -eq "ReadableForced") {
+            $expectedTitle = ConvertTo-IdentityKey ([string]$item.Title)
+            $actualTitle = ConvertTo-IdentityKey ([string]$probe.Title)
+            if ($expectedTitle) {
+                $identityMax += 4
+                if ($actualTitle -and $actualTitle -eq $expectedTitle) {
+                    $identityScore += 4
+                    $titleMatch = $true
+                }
+                elseif ($actualTitle) {
+                    $identityConflicts.Add("Title")
+                }
+            }
+
+            $expectedArtist = ConvertTo-IdentityKey ([string]$item.Artist)
+            $actualArtist = ConvertTo-IdentityKey ([string]$probe.Artist)
+            if ($expectedArtist) {
+                $identityMax += 3
+                if ($actualArtist -and $actualArtist -eq $expectedArtist) {
+                    $identityScore += 3
+                    $artistMatch = $true
+                }
+                elseif ($actualArtist) {
+                    $identityConflicts.Add("Artist")
+                }
+            }
+
+            $expectedAlbum = ConvertTo-IdentityKey ([string]$item.Album)
+            $actualAlbum = ConvertTo-IdentityKey ([string]$probe.Album)
+            if ($expectedAlbum) {
+                $identityMax += 2
+                if ($actualAlbum -and $actualAlbum -eq $expectedAlbum) {
+                    $identityScore += 2
+                    $albumMatch = $true
+                }
+                elseif ($actualAlbum) {
+                    $identityConflicts.Add("Album")
+                }
+            }
+
+            $expectedTrack = 0
+            $actualTrack = 0
+            if ([int]::TryParse([string]$item.Track, [ref]$expectedTrack)) {
+                $identityMax += 1
+                if ([int]::TryParse([string]$probe.Track, [ref]$actualTrack) -and $actualTrack -eq $expectedTrack) {
+                    $identityScore += 1
+                    $trackMatch = $true
+                }
+                elseif ($null -ne $probe.Track) {
+                    $identityConflicts.Add("Track")
+                }
+            }
+
+            $expectedDisc = 0
+            $actualDisc = 0
+            if ([int]::TryParse([string]$item.Disc, [ref]$expectedDisc)) {
+                $identityMax += 1
+                if ([int]::TryParse([string]$probe.Disc, [ref]$actualDisc) -and $actualDisc -eq $expectedDisc) {
+                    $identityScore += 1
+                    $discMatch = $true
+                }
+                elseif ($null -ne $probe.Disc) {
+                    $identityConflicts.Add("Disc")
+                }
+            }
+
+            $hardConflict = (
+                $identityConflicts.Contains("Title") -or
+                ($identityConflicts.Contains("Artist") -and -not $albumMatch)
+            )
+
+            if ($hardConflict) {
+                $status = "CandidateForcedDemuxerIdentityConflict"
+            }
+            else {
+                $status = "CandidateForcedDemuxerReview"
+            }
+        }
+
+        $item.CandidateStatus = $status
+
+        $validations.Add([pscustomobject]@{
+            CandidateStatus          = $status
+            SourcePath               = $item.SourcePath
+            CandidatePath            = $candidatePath
+            CandidateExtension       = if (Test-Path -LiteralPath $candidatePath -PathType Leaf) { [IO.Path]::GetExtension($candidatePath).ToLowerInvariant() } else { $null }
+            ProbeStatus              = $probeStatus
+            NormalProbeError         = $normalProbeError
+            ForcedDemuxer            = $forcedDemuxer
+            ForcedProbeStatus        = $forcedProbeStatus
+            ForcedDecodeStatus       = $forcedDecodeStatus
+            StrictDecodeStatus       = $strictDecodeStatus
+            DurationStatus           = $durationStatus
+            CandidateDurationSeconds = $durationSeconds
+            IdentityScore            = $identityScore
+            IdentityMax              = $identityMax
+            IdentityConflicts        = ($identityConflicts -join ",")
+            ExpectedArtist           = $item.Artist
+            CandidateArtist          = $candidateArtist
+            ArtistMatch              = $artistMatch
+            ExpectedAlbum            = $item.Album
+            CandidateAlbum           = $candidateAlbum
+            AlbumMatch               = $albumMatch
+            ExpectedDisc             = $item.Disc
+            CandidateDisc            = $candidateDisc
+            DiscMatch                = $discMatch
+            ExpectedTrack            = $item.Track
+            CandidateTrack           = $candidateTrack
+            TrackMatch               = $trackMatch
+            ExpectedTitle            = $item.Title
+            CandidateTitle           = $candidateTitle
+            TitleMatch               = $titleMatch
+            StrictError              = $strictError
+        })
+    }
+
+    $intake |
+        Sort-Object AlbumDirectory, Disc, Track, SourcePath |
+        Export-Csv -LiteralPath $intakePath -NoTypeInformation -Encoding UTF8
+
+    $validations |
+        Sort-Object CandidateStatus, SourcePath |
+        Export-Csv -LiteralPath $validationPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($intake | Group-Object CandidateStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "CandidateStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+    foreach ($group in ($validations | Group-Object StrictDecodeStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "StrictDecodeStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT CANDIDATE REVIEW"
+    Write-Host ("=" * 72)
+    Write-Host "Eligible sources : $($eligible.Count)"
+    Write-Host "Candidate paths  : $($withCandidate.Count)"
+
+    Write-Host ""
+    Write-Host "Candidate status:"
+    foreach ($group in ($intake | Group-Object CandidateStatus | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-34} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Files:"
+    Write-Host "  Intake     : $intakePath"
+    Write-Host "  Validation : $validationPath"
+    Write-Host "  Summary    : $summaryPath"
+
+    if ($withCandidate.Count -eq 0) {
+        Write-Host ""
+        Write-Host "No candidate paths are assigned yet."
+        Write-Host "Add a local file path to CandidatePath in replacement-candidate-intake.csv, then rerun this mode."
+    }
+
+    Write-Host ""
+    Write-Host "Candidate files were read for validation only."
+    Write-Host "No source media files were modified."
+    Write-Host "No candidate media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "CandidateValidatedForReview means structurally clean and identity-plausible; it does NOT authorize staging or replacement.`nCandidateForcedDemuxerReview means normal probing failed but an extension-specific forced demuxer passed probe/decode; it always requires review."
 }
 
 
@@ -2975,19 +3553,20 @@ $exclusiveModes = @(
         [bool]$BuildRepairQueue,
         [bool]$AnalyzeReplacementReview,
         [bool]$AnalyzeReplacementEvidence,
+        [bool]$ReviewReplacementCandidates,
         [bool]$ApplyApproved
     ) | Where-Object { $_ }
 )
 
 if ($exclusiveModes.Count -gt 1) {
-    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, and -ApplyApproved are mutually exclusive modes."
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, -ReviewReplacementCandidates, and -ApplyApproved are mutually exclusive modes."
 }
 
 if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not $BuildRepairQueue -and -not $AnalyzeReplacementReview -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
-if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     throw "ffmpeg was not found in PATH."
 }
 if (($AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
@@ -2998,7 +3577,7 @@ New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
 # Audit/report-analysis output is intentionally isolated from persistent repair
 # state so whole-library analysis cannot overwrite an in-progress review.
-$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence) { Join-Path $StateRoot "audit" } else { $StateRoot }
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -3012,12 +3591,16 @@ $FailureClassificationReport = Join-Path $ReportRoot "failure-classification.csv
 $FailureReclassifiedReport = Join-Path $ReportRoot "failure-classification-reclassified.csv"
 $RepairActionQueueReport = Join-Path $ReportRoot "repair-action-queue.csv"
 $ReplacementReviewAnalysisReport = Join-Path $ReportRoot "replacement-review-analysis.csv"
+$ReplacementEvidenceAnalysisReport = Join-Path $ReportRoot "replacement-evidence-analysis.csv"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($ReviewReplacementCandidates) {
+    "REVIEW REPLACEMENT CANDIDATES"
 }
 elseif ($AnalyzeReplacementEvidence) {
     "ANALYZE REPLACEMENT EVIDENCE"
@@ -3051,6 +3634,13 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($ReviewReplacementCandidates) {
+    Invoke-ReviewReplacementCandidates `
+        -EvidenceAnalysisPath $ReplacementEvidenceAnalysisReport `
+        -OutputRoot $ReportRoot
+    return
+}
 
 if ($AnalyzeReplacementEvidence) {
     Invoke-AnalyzeReplacementEvidence `

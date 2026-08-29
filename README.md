@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.10.1-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.11.1-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.10.1**
+> Current development baseline: **v0.7-dev.11.1**
 
 ## Core workflow
 
@@ -220,6 +220,22 @@ replacement-evidence-summary.csv
 
 Possible evidence resolutions include `ConfirmedSevereAudioDamage`, `ContainerOrHeaderFailure`, `ProbeDurationUnavailable`, `AudioDecodesButDurationUnknown`, `UnreadableMediaSource`, `MissingSourcePath`, and `NeedsManualInspection`. Even a high-confidence result remains review-only and does not authorize replacement.
 
+Create and review local replacement candidates:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -ReviewReplacementCandidates
+```
+
+The first run creates `replacement-candidate-intake.csv` for high-confidence `UnreadableMediaSource` items. Add a local replacement file path to the `CandidatePath` column for any item you want to test, then rerun the same command.
+
+Candidate validation checks that the file exists, is a supported audio format, is readable by ffprobe, passes the strict audio-decode gate, has a usable duration, and has plausible artist/album/track/title identity. Results are written to `replacement-candidate-validation.csv` and `replacement-candidate-summary.csv`.
+
+`CandidateValidatedForReview` is deliberately not an approval state. It means the candidate is structurally clean and identity-plausible enough for human review; staging and replacement remain disabled.
+
+If normal probing fails for a `.mp3`, dev.11.1 performs a conservative MP3-demuxer fallback. A candidate that passes forced MP3 probe and forced strict decode is labeled `CandidateForcedDemuxerReview`, never silently promoted to normal validation. The report preserves the normal-probe failure and the forced-probe/decode evidence.
+
 ## Failure-domain model
 
 The classifier separates the primary problem from all FFmpeg evidence.
@@ -303,7 +319,7 @@ Generated reports may contain local paths and are intentionally excluded from ve
 
 The v0.6 engine established the safe transactional repair foundation.
 
-The v0.7 development branch now includes replacement-needed persistence, read-only whole-library auditing, targeted failure rechecks, canonical FFmpeg signatures, primary vs evidence domains, tolerant decode severity measurement, full failure classification, report-only reclassification, a report-only repair action queue, a focused read-only analyzer for `ReplacementReview` items, and a targeted diagnostic pass for unresolved replacement evidence.
+The v0.7 development branch now includes replacement-needed persistence, read-only whole-library auditing, targeted failure rechecks, canonical FFmpeg signatures, primary vs evidence domains, tolerant decode severity measurement, full failure classification, report-only reclassification, a report-only repair action queue, a focused read-only analyzer for `ReplacementReview` items, a targeted diagnostic pass for unresolved replacement evidence, and non-destructive local candidate intake/validation.
 
 The next major step is verified replacement candidate selection, strict candidate validation, staging, transactional swap, rollback, and album re-audit.
 
