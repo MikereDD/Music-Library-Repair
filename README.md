@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.13-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.14.1-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.13**
+> Current development baseline: **v0.7-dev.14.1**
 
 ## Core workflow
 
@@ -247,6 +247,22 @@ Dev.13 adds explicit, non-destructive staging. Set `StageApproved` to `Yes` only
 ```
 
 Only `CandidateValidatedForReview` and `CandidateForcedDemuxerReview` are stage-eligible. The candidate is copied into the repair workspace under `staging/`, SHA-256 is checked before and after finalization, and the staged copy is strict-decoded again. `StagedVerified` still does not authorize replacement and the original library file is untouched.
+
+Dev.14 adds the first transactional replacement commit. Replacement requires three explicit gates: `ReplaceApproved=Yes` in the candidate intake plus `-BackupOriginals` and `-Yes` on the command line.
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -ApplyStagedReplacements `
+    -BackupOriginals `
+    -Yes
+```
+
+Only `StagedVerified` items are eligible. Before commit, the current source is SHA-256 hashed, copied to `replacement-backups/`, and the backup hash must match. The staged file is re-hashed, copied into the source directory as a temporary file, and strict-decoded again. Same-extension replacements use `File.Replace`; cross-extension replacements are published under the correct extension and the damaged source is removed only after the new file passes hash and strict-decode verification. Any transaction failure triggers best-effort rollback from the verified backup. Backups are retained even after success.
+
+Dev.14.1 adds a conservative quality-class gate before any replacement commit. The tool classifies only formats that are safe to infer from the extension: FLAC/WAV/AIFF/APE as lossless and MP3/AAC/Opus as lossy. Ambiguous containers such as M4A, OGG, WMA, and WV remain `Unknown` rather than being guessed.
+
+A known lossless-to-lossy replacement is reported as `QualityDowngrade` and is blocked unless the candidate intake row also has `QualityDowngradeApproved=Yes`. This approval is separate from `ReplaceApproved` so a structurally valid replacement cannot silently reduce the library's quality class.
 
 ## Failure-domain model
 

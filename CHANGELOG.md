@@ -21,6 +21,20 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- Dev.14.1 conservative source/replacement quality-class comparison
+- Explicit `QualityDowngradeApproved` intake gate for known lossless-to-lossy replacements
+- `QualityDowngrade`, `SameQualityClass`, `LosslessClassCandidate`, and `Unknown` relationship reporting
+- Conservative extension classification: FLAC/WAV/AIFF/APE as lossless; MP3/AAC/Opus as lossy; ambiguous containers remain `Unknown`
+- Transaction manifest fields for source class, replacement class, relationship, and downgrade approval
+- `-ApplyStagedReplacements` transactional replacement mode
+- Explicit triple gate: `ReplaceApproved=Yes`, `-BackupOriginals`, and `-Yes`
+- Verified backup copy before any source mutation
+- SHA-256 revalidation of the staged candidate immediately before replacement
+- Same-extension commit via `System.IO.File.Replace`
+- Cross-extension commit that publishes the verified replacement first and removes the damaged source only after final verification
+- Post-commit SHA-256 and strict-decode verification
+- Automatic best-effort rollback from the verified backup on transaction failure
+- Retained replacement backups plus transaction manifest/summary reports
 - `-StageReplacementCandidates` explicit non-destructive staging mode
 - `StageApproved` intake field; only explicitly approved candidates are considered
 - Stage eligibility limited to `CandidateValidatedForReview` and `CandidateForcedDemuxerReview`

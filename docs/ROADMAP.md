@@ -63,6 +63,23 @@ Implemented in `v0.7-dev.13`:
 - staging manifest and summary reports
 - no original-library or persistent-state mutation
 
+Implemented in `v0.7-dev.14`:
+
+- explicit replacement approval gate
+- verified pre-commit backup
+- transactional same-extension replacement
+- safe cross-extension replacement publication
+- post-commit hash and strict-decode verification
+- automatic best-effort rollback on failure
+- retained backup and transaction reports
+
+Implemented in `v0.7-dev.14.1`:
+
+- conservative media quality-class comparison
+- explicit lossless-to-lossy downgrade approval gate
+- ambiguous containers remain Unknown rather than guessed
+- quality relationship fields in transaction reporting
+
 Next:
 
 - exercise dev.11 candidate intake against known clean local replacement files

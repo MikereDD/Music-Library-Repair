@@ -20,6 +20,7 @@ param(
     [switch]$AnalyzeReplacementEvidence,
     [switch]$ReviewReplacementCandidates,
     [switch]$StageReplacementCandidates,
+    [switch]$ApplyStagedReplacements,
     [ValidateRange(1,50)]
     [int]$FailureSamplesPerSignature = 5
 )
@@ -27,7 +28,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.13"
+$ToolVersion = "0.7-dev.14.1"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -1060,9 +1061,11 @@ function Invoke-ReviewReplacementCandidates {
             Track          = $row.Track
             Title          = $row.Title
             Extension      = $row.Extension
-            CandidatePath  = if ($existing) { $existing.CandidatePath } else { $null }
-            StageApproved  = if ($existing -and $existing.PSObject.Properties["StageApproved"]) { $existing.StageApproved } else { "No" }
-            ReviewNotes    = if ($existing) { $existing.ReviewNotes } else { $null }
+            CandidatePath             = if ($existing) { $existing.CandidatePath } else { $null }
+            StageApproved             = if ($existing -and $existing.PSObject.Properties["StageApproved"]) { $existing.StageApproved } else { "No" }
+            ReplaceApproved           = if ($existing -and $existing.PSObject.Properties["ReplaceApproved"]) { $existing.ReplaceApproved } else { "No" }
+            QualityDowngradeApproved  = if ($existing -and $existing.PSObject.Properties["QualityDowngradeApproved"]) { $existing.QualityDowngradeApproved } else { "No" }
+            ReviewNotes               = if ($existing) { $existing.ReviewNotes } else { $null }
         })
     }
 
@@ -1703,6 +1706,428 @@ function Invoke-StageReplacementCandidates {
     Write-Host "Candidate source files were NOT modified."
     Write-Host "Persistent repair state was NOT modified."
     Write-Host "StagedVerified means the copy hash matches and the staged copy passed strict decode; it does NOT authorize replacement."
+}
+
+
+
+function Get-MediaQualityClassFromExtension {
+    param([AllowNull()][string]$PathOrExtension)
+
+    if ([string]::IsNullOrWhiteSpace($PathOrExtension)) {
+        return "Unknown"
+    }
+
+    $ext = $PathOrExtension
+    if (-not $ext.StartsWith(".")) {
+        $ext = [IO.Path]::GetExtension($PathOrExtension)
+    }
+    $ext = $ext.ToLowerInvariant()
+
+    # Keep this deliberately conservative. Ambiguous containers stay Unknown.
+    switch ($ext) {
+        ".flac" { return "Lossless" }
+        ".wav"  { return "Lossless" }
+        ".aiff" { return "Lossless" }
+        ".aif"  { return "Lossless" }
+        ".ape"  { return "Lossless" }
+
+        ".mp3"  { return "Lossy" }
+        ".aac"  { return "Lossy" }
+        ".opus" { return "Lossy" }
+
+        default { return "Unknown" }
+    }
+}
+
+function Get-ReplacementQualityRelationship {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$ReplacementPath
+    )
+
+    $sourceClass = Get-MediaQualityClassFromExtension -PathOrExtension $SourcePath
+    $replacementClass = Get-MediaQualityClassFromExtension -PathOrExtension $ReplacementPath
+
+    $relationship =
+        if ($sourceClass -eq "Lossless" -and $replacementClass -eq "Lossy") {
+            "QualityDowngrade"
+        }
+        elseif ($sourceClass -eq "Lossy" -and $replacementClass -eq "Lossless") {
+            # This only describes the media class of the supplied candidate.
+            # It does not prove that the candidate originated from a true lossless master.
+            "LosslessClassCandidate"
+        }
+        elseif ($sourceClass -eq $replacementClass -and $sourceClass -ne "Unknown") {
+            "SameQualityClass"
+        }
+        else {
+            "Unknown"
+        }
+
+    [pscustomobject]@{
+        SourceClass      = $sourceClass
+        ReplacementClass = $replacementClass
+        Relationship     = $relationship
+    }
+}
+
+function Get-ReplacementTargetPath {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$StagedPath
+    )
+
+    $sourceExt = [IO.Path]::GetExtension($SourcePath)
+    $stagedExt = [IO.Path]::GetExtension($StagedPath)
+
+    if ([string]::IsNullOrWhiteSpace($stagedExt)) {
+        throw "Staged replacement has no file extension: $StagedPath"
+    }
+
+    if ([string]::Equals($sourceExt, $stagedExt, [StringComparison]::OrdinalIgnoreCase)) {
+        return $SourcePath
+    }
+
+    return [IO.Path]::ChangeExtension($SourcePath, $stagedExt)
+}
+
+function Test-ReplacementMediaDecode {
+    param(
+        [Parameter(Mandatory)][System.IO.FileInfo]$File,
+        [AllowNull()][string]$ForcedDemuxer
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ForcedDemuxer)) {
+        return Test-CandidateAudioDecodeForced -File $File -Demuxer $ForcedDemuxer
+    }
+
+    return Test-SourceAudioDecode -File $File
+}
+
+function Invoke-ApplyStagedReplacements {
+    param(
+        [Parameter(Mandatory)][string]$CandidateIntakePath,
+        [Parameter(Mandatory)][string]$StagingManifestPath,
+        [Parameter(Mandatory)][string]$BackupRoot,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not $BackupOriginals) {
+        throw "-ApplyStagedReplacements requires -BackupOriginals."
+    }
+    if (-not $Yes) {
+        throw "-ApplyStagedReplacements requires -Yes. This mode modifies the music library."
+    }
+    if (-not (Test-Path -LiteralPath $CandidateIntakePath -PathType Leaf)) {
+        throw "Candidate intake not found: $CandidateIntakePath"
+    }
+    if (-not (Test-Path -LiteralPath $StagingManifestPath -PathType Leaf)) {
+        throw "Staging manifest not found: $StagingManifestPath`nRun -StageReplacementCandidates first."
+    }
+
+    $intake = @(Import-Csv -LiteralPath $CandidateIntakePath)
+    $staging = @(Import-Csv -LiteralPath $StagingManifestPath)
+
+    $stagingBySource = @{}
+    foreach ($row in $staging) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$row.SourcePath)) {
+            $stagingBySource[[string]$row.SourcePath] = $row
+        }
+    }
+
+    $approved = @(
+        $intake | Where-Object {
+            Test-TruthyStageApproval ([string]$_.ReplaceApproved)
+        }
+    )
+
+    $transactionPath = Join-Path $OutputRoot "replacement-transaction-manifest.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-transaction-summary.csv"
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    }
+
+    foreach ($item in $approved) {
+        $sourcePath = [string]$item.SourcePath
+        $status = "Blocked"
+        $reason = $null
+        $stagedPath = $null
+        $targetPath = $null
+        $backupPath = $null
+        $sourceHash = $null
+        $backupHash = $null
+        $stagedHashExpected = $null
+        $stagedHashObserved = $null
+        $targetHash = $null
+        $backupVerified = $false
+        $stagedVerified = $false
+        $targetDecodeStatus = "NotRun"
+        $rollbackPerformed = $false
+        $forcedDemuxer = $null
+        $sourceRemoved = $false
+        $sourceQualityClass = $null
+        $replacementQualityClass = $null
+        $qualityRelationship = $null
+        $qualityDowngradeApproved = $false
+
+        try {
+            if (-not $stagingBySource.ContainsKey($sourcePath)) {
+                $reason = "NoStagingManifest"
+                continue
+            }
+
+            $stage = $stagingBySource[$sourcePath]
+            if ([string]$stage.StageStatus -ne "StagedVerified") {
+                $reason = "StageStatusNotVerified"
+                continue
+            }
+
+            $stagedPath = [string]$stage.StagedPath
+            $stagedHashExpected = ([string]$stage.StagedSHA256).ToLowerInvariant()
+            $forcedDemuxer = [string]$stage.ForcedDemuxer
+
+            if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                $reason = "SourceMissing"
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($stagedPath) -or -not (Test-Path -LiteralPath $stagedPath -PathType Leaf)) {
+                $reason = "StagedFileMissing"
+                continue
+            }
+
+            $stagedHashObserved = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($stagedHashExpected) -or $stagedHashObserved -ne $stagedHashExpected) {
+                $reason = "StagedHashChanged"
+                continue
+            }
+            $stagedVerified = $true
+
+            $targetPath = Get-ReplacementTargetPath -SourcePath $sourcePath -StagedPath $stagedPath
+
+            $quality = Get-ReplacementQualityRelationship -SourcePath $sourcePath -ReplacementPath $targetPath
+            $sourceQualityClass = $quality.SourceClass
+            $replacementQualityClass = $quality.ReplacementClass
+            $qualityRelationship = $quality.Relationship
+            $qualityDowngradeApproved = Test-TruthyStageApproval ([string]$item.QualityDowngradeApproved)
+
+            if ($qualityRelationship -eq "QualityDowngrade" -and -not $qualityDowngradeApproved) {
+                $reason = "QualityDowngradeRequiresExplicitApproval"
+                continue
+            }
+
+            if (-not [string]::Equals($targetPath, $sourcePath, [StringComparison]::OrdinalIgnoreCase) -and
+                (Test-Path -LiteralPath $targetPath)) {
+                $reason = "ReplacementTargetAlreadyExists"
+                continue
+            }
+
+            $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+            $sourceKey = Get-StagingSourceKey -SourcePath $sourcePath
+            $stamp = (Get-Date).ToString("yyyyMMdd-HHmmssfff")
+            $backupDir = Join-Path (Join-Path $BackupRoot $sourceKey) $stamp
+            New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+            $backupPath = Join-Path $backupDir ([IO.Path]::GetFileName($sourcePath))
+
+            Copy-Item -LiteralPath $sourcePath -Destination $backupPath -Force
+            $backupHash = (Get-FileHash -LiteralPath $backupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($backupHash -ne $sourceHash) {
+                $reason = "BackupHashMismatch"
+                continue
+            }
+            $backupVerified = $true
+
+            $targetDir = Split-Path -Parent $targetPath
+            $targetExt = [IO.Path]::GetExtension($targetPath)
+            $targetStem = [IO.Path]::GetFileNameWithoutExtension($targetPath)
+            $tempName = ".{0}.replacement-{1}{2}" -f $targetStem,([guid]::NewGuid().ToString("N")),$targetExt
+            $tempPath = Join-Path $targetDir $tempName
+
+            try {
+                Copy-Item -LiteralPath $stagedPath -Destination $tempPath -Force
+
+                $tempHash = (Get-FileHash -LiteralPath $tempPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($tempHash -ne $stagedHashObserved) {
+                    throw "Temporary replacement copy hash mismatch."
+                }
+
+                $tempFile = Get-Item -LiteralPath $tempPath
+                $tempDecode = Test-ReplacementMediaDecode -File $tempFile -ForcedDemuxer $forcedDemuxer
+                if (-not $tempDecode.Clean) {
+                    throw "Temporary replacement strict decode failed: $($tempDecode.ErrorText)"
+                }
+
+                if ([string]::Equals($targetPath, $sourcePath, [StringComparison]::OrdinalIgnoreCase)) {
+                    # Same-extension replacement. Replace the destination only after the
+                    # backup and replacement temp file have both been independently verified.
+                    [IO.File]::Replace($tempPath, $sourcePath, $null, $true)
+                }
+                else {
+                    # Cross-extension replacement. First publish the verified replacement
+                    # under its correct extension while leaving the original source intact.
+                    Move-Item -LiteralPath $tempPath -Destination $targetPath
+
+                    $publishedHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($publishedHash -ne $stagedHashObserved) {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                        throw "Published replacement hash mismatch."
+                    }
+
+                    $publishedFile = Get-Item -LiteralPath $targetPath
+                    $publishedDecode = Test-ReplacementMediaDecode -File $publishedFile -ForcedDemuxer $forcedDemuxer
+                    if (-not $publishedDecode.Clean) {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                        throw "Published replacement strict decode failed: $($publishedDecode.ErrorText)"
+                    }
+
+                    # Remove the damaged source only after the replacement is fully verified.
+                    try {
+                        Remove-Item -LiteralPath $sourcePath -Force
+                        $sourceRemoved = $true
+                    }
+                    catch {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                        throw "Could not remove original source after publishing replacement: $($_.Exception.Message)"
+                    }
+                }
+
+                if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
+                    throw "Replacement target is missing after commit."
+                }
+
+                $targetHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($targetHash -ne $stagedHashObserved) {
+                    throw "Committed replacement hash mismatch."
+                }
+
+                $targetFile = Get-Item -LiteralPath $targetPath
+                $targetDecode = Test-ReplacementMediaDecode -File $targetFile -ForcedDemuxer $forcedDemuxer
+                if (-not $targetDecode.Clean) {
+                    throw "Committed replacement strict decode failed: $($targetDecode.ErrorText)"
+                }
+
+                $targetDecodeStatus = if ($forcedDemuxer) { "PassForced" } else { "Pass" }
+                $status = "ReplacementCommitted"
+                $reason = $null
+            }
+            catch {
+                $reason = $_.Exception.Message
+                $targetDecodeStatus = "Failed"
+
+                # Best-effort rollback. The verified backup is the authority.
+                try {
+                    if (-not [string]::IsNullOrWhiteSpace($targetPath) -and
+                        (Test-Path -LiteralPath $targetPath -PathType Leaf) -and
+                        -not [string]::Equals($targetPath, $sourcePath, [StringComparison]::OrdinalIgnoreCase)) {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                    }
+
+                    if ($backupVerified) {
+                        Copy-Item -LiteralPath $backupPath -Destination $sourcePath -Force
+                        $restoredHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                        if ($restoredHash -eq $sourceHash) {
+                            $rollbackPerformed = $true
+                            $status = "RolledBack"
+                        }
+                        else {
+                            $status = "RollbackFailed"
+                            $reason = "$reason | restored source hash mismatch"
+                        }
+                    }
+                }
+                catch {
+                    $status = "RollbackFailed"
+                    $reason = "$reason | rollback error: $($_.Exception.Message)"
+                }
+            }
+            finally {
+                if (Test-Path -LiteralPath $tempPath) {
+                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        finally {
+            $rows.Add([pscustomobject]@{
+                TransactionStatus   = $status
+                BlockReason         = $reason
+                SourcePath          = $sourcePath
+                StagedPath          = $stagedPath
+                ReplacementPath     = $targetPath
+                BackupPath          = $backupPath
+                ForcedDemuxer       = $forcedDemuxer
+                SourceQualityClass  = $sourceQualityClass
+                ReplacementQualityClass = $replacementQualityClass
+                QualityRelationship = $qualityRelationship
+                QualityDowngradeApproved = $qualityDowngradeApproved
+                SourceSHA256        = $sourceHash
+                BackupSHA256        = $backupHash
+                StagedSHA256Expected= $stagedHashExpected
+                StagedSHA256Observed= $stagedHashObserved
+                ReplacementSHA256   = $targetHash
+                BackupVerified      = $backupVerified
+                StagedVerified      = $stagedVerified
+                ReplacementDecode   = $targetDecodeStatus
+                RollbackPerformed   = $rollbackPerformed
+                SourceRemoved       = $sourceRemoved
+                TransactionAt       = (Get-Date).ToString("o")
+            })
+        }
+    }
+
+    $rows |
+        Sort-Object TransactionStatus, SourcePath |
+        Export-Csv -LiteralPath $transactionPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($rows | Group-Object TransactionStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "TransactionStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " STAGED REPLACEMENT TRANSACTIONS"
+    Write-Host ("=" * 72)
+    Write-Host "Approved for replacement : $($approved.Count)"
+
+    Write-Host ""
+    Write-Host "Transaction status:"
+    if ($rows.Count -eq 0) {
+        Write-Host "  Nothing approved for replacement."
+    }
+    else {
+        foreach ($group in ($rows | Group-Object TransactionStatus | Sort-Object Count -Descending)) {
+            Write-Host ("  {0,-28} {1,6}" -f $group.Name,$group.Count)
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Files:"
+    Write-Host "  Manifest : $transactionPath"
+    Write-Host "  Summary  : $summaryPath"
+    Write-Host "  Backups  : $BackupRoot"
+
+    if ($approved.Count -eq 0) {
+        Write-Host ""
+        Write-Host "Set ReplaceApproved to Yes for a reviewed, StagedVerified candidate, then rerun."
+    }
+
+    Write-Host ""
+    Write-Host "Replacement requires explicit ReplaceApproved=Yes, -BackupOriginals, and -Yes."
+    Write-Host "Known lossless-to-lossy replacement also requires QualityDowngradeApproved=Yes."
+    Write-Host "Ambiguous media classes are reported as Unknown rather than guessed."
+    Write-Host "Every source is backed up and hash-verified before commit."
+    Write-Host "The replacement is hash-verified and strict-decoded before the transaction is accepted."
+    Write-Host "Failures trigger best-effort rollback from the verified backup."
+    Write-Host "Backups are retained after successful replacement for manual recovery."
 }
 
 
@@ -3941,19 +4366,20 @@ $exclusiveModes = @(
         [bool]$AnalyzeReplacementEvidence,
         [bool]$ReviewReplacementCandidates,
         [bool]$StageReplacementCandidates,
+        [bool]$ApplyStagedReplacements,
         [bool]$ApplyApproved
     ) | Where-Object { $_ }
 )
 
 if ($exclusiveModes.Count -gt 1) {
-    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, -ReviewReplacementCandidates, -StageReplacementCandidates, and -ApplyApproved are mutually exclusive modes."
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, -ReviewReplacementCandidates, -StageReplacementCandidates, -ApplyStagedReplacements, and -ApplyApproved are mutually exclusive modes."
 }
 
 if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not $BuildRepairQueue -and -not $AnalyzeReplacementReview -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
-if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates -or $ApplyStagedReplacements) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     throw "ffmpeg was not found in PATH."
 }
 if (($AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
@@ -3964,7 +4390,7 @@ New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
 # Audit/report-analysis output is intentionally isolated from persistent repair
 # state so whole-library analysis cannot overwrite an in-progress review.
-$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates) { Join-Path $StateRoot "audit" } else { $StateRoot }
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates -or $ApplyStagedReplacements) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -3982,12 +4408,17 @@ $ReplacementEvidenceAnalysisReport = Join-Path $ReportRoot "replacement-evidence
 $ReplacementCandidateIntakeReport = Join-Path $ReportRoot "replacement-candidate-intake.csv"
 $ReplacementCandidateValidationReport = Join-Path $ReportRoot "replacement-candidate-validation.csv"
 $ReplacementStagingRoot = Join-Path $StateRoot "staging"
+$ReplacementStagingManifestReport = Join-Path $ReportRoot "replacement-staging-manifest.csv"
+$ReplacementBackupRoot = Join-Path $StateRoot "replacement-backups"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($ApplyStagedReplacements) {
+    "APPLY STAGED REPLACEMENTS"
 }
 elseif ($StageReplacementCandidates) {
     "STAGE REPLACEMENT CANDIDATES"
@@ -4027,6 +4458,15 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($ApplyStagedReplacements) {
+    Invoke-ApplyStagedReplacements `
+        -CandidateIntakePath $ReplacementCandidateIntakeReport `
+        -StagingManifestPath $ReplacementStagingManifestReport `
+        -BackupRoot $ReplacementBackupRoot `
+        -OutputRoot $ReportRoot
+    return
+}
 
 if ($StageReplacementCandidates) {
     Invoke-StageReplacementCandidates `
