@@ -1,12 +1,40 @@
-# Music Library Repair
+<p align="center">
+  <img src="assets/Music-Library-Repair-logo.png" alt="Music Library Repair logo" width="240">
+</p>
 
-**Typezer∅ Music Library Repair** is a safety-first Windows/PowerShell toolkit for auditing, normalizing, repairing, and verifying music libraries without re-encoding healthy audio.
+<h1 align="center">Music Library Repair</h1>
+
+<p align="center">
+  <strong>Typezer∅ Music Library Repair</strong><br>
+  Safety-first auditing, normalization, repair, and verification for large Windows music libraries.
+</p>
+
+<p align="center">
+  <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
+  <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.7.2-orange.svg">
+  <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#safety-model">Safety model</a> ·
+  <a href="#audit--diagnostics">Audit & diagnostics</a> ·
+  <a href="docs/ROADMAP.md">Roadmap</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="SECURITY.md">Security</a>
+</p>
+
+---
+
+**Music Library Repair** is a conservative Windows/PowerShell toolkit for discovering, auditing, normalizing, repairing, and verifying large music libraries without re-encoding healthy audio.
+
+> **Never turn a metadata problem into an audio problem.**
+
+The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
 > Current development baseline: **v0.7-dev.7.2**
-
-The project grew out of real-world cleanup work against large, inconsistent music libraries. Its core rule is simple:
-
-**Never turn a metadata problem into an audio problem.**
 
 ## Core workflow
 
@@ -20,42 +48,45 @@ Discover
   → Verify again
 ```
 
-The repair engine is deliberately conservative. Ambiguous releases, damaged source audio, unresolved artwork, and suspicious metadata are surfaced for review rather than guessed away.
+Ambiguity is surfaced. Damaged source audio is blocked. Artwork errors stay artwork errors. Originals are not replaced until a staged result has been verified.
 
-## Current capabilities
+## Highlights
 
-- Recursive discovery from an arbitrary library root
-- Metadata inspection through `ffprobe`
-- Strict source-audio decode audit using `ffmpeg -xerror -err_detect explode`
+- Recursive discovery from any library root
+- Metadata inspection with `ffprobe`
+- Strict full-audio decode auditing with `ffmpeg`
+- Read-only whole-library audit mode
 - Album-level interactive review
 - Persistent state/resume
 - Canonical filename planning
-- Single-disc naming:
-  - `01 - Artist - Title.ext`
-- Multi-disc naming:
-  - `1-01 - Artist - Title.ext`
-- Metadata normalization
-- Album-artist repair
-- Suspicious 30-character title detection for likely ID3v1 truncation
+- Metadata and album-artist normalization
+- Suspicious/truncated-title detection
 - Per-track title overrides
-- Loose artwork detection
+- Loose and embedded artwork inspection
 - Embedded artwork recovery
 - MusicBrainz release lookup
 - Exact-release Cover Art Archive lookup
-- Cover provenance stored in state
-- Explicit unresolved/missing-cover handling
-- Approval blocking when source decode errors exist
+- Cover provenance tracking
 - Transactional MP3 rewrite/apply
-- Audio stream-copy only; no audio re-encoding
-- Backup-original option
-- Post-write metadata/artwork/decode verification
-- Apply report generation
+- Stream-copy only for healthy audio — no audio re-encoding
+- Optional original backups
+- Post-write metadata, artwork, and strict-decode verification
+- Failure-domain classification for audio, artwork, and container problems
+- Replacement-review queue foundation for genuinely bad source media
 
-## Important v0.6 limitation
+## Canonical filenames
 
-**Apply mode is deliberately MP3-only.**
+Single-disc releases:
 
-Discovery and auditing understand additional formats, but v0.6 will not rewrite non-MP3 albums. FLAC/M4A and broader apply support are roadmap items.
+```text
+01 - Artist - Title.ext
+```
+
+Multi-disc releases:
+
+```text
+1-01 - Artist - Title.ext
+```
 
 ## Requirements
 
@@ -63,9 +94,7 @@ Discovery and auditing understand additional formats, but v0.6 will not rewrite 
 - PowerShell 7+
 - `ffmpeg`
 - `ffprobe`
-- Internet access only when using MusicBrainz / Cover Art Archive lookup
-
-Verify the required executables are visible:
+- Internet access only for MusicBrainz / Cover Art Archive lookup
 
 ```powershell
 Get-Command ffmpeg
@@ -74,14 +103,12 @@ Get-Command ffprobe
 
 ## Quick start
 
-From the repository root:
-
 ```powershell
 .\src\Repair-MusicLibrary.ps1 `
     -Root "P:\Music"
 ```
 
-Resume an existing review:
+Resume:
 
 ```powershell
 .\src\Repair-MusicLibrary.ps1 `
@@ -89,50 +116,7 @@ Resume an existing review:
     -Resume
 ```
 
-Run a non-interactive, read-only whole-library audit:
-
-```powershell
-.\src\Repair-MusicLibrary.ps1 `
-    -Root "P:\Music" `
-    -AuditOnly
-```
-
-`-AuditOnly` writes reports under `$HOME\Downloads\Music-Library-Repair\audit` and deliberately does **not** modify persistent repair/review state.
-
-
-Analyze the most recent audit reports **without decoding the library again**:
-
-```powershell
-.\src\Repair-MusicLibrary.ps1 `
-    -Root "P:\Music" `
-    -AnalyzeAuditReports
-```
-
-This produces failure classification reports by extension, decoder signature, album concentration, and ffprobe/decode cross-check.
-
-
-Recheck only the files that failed the previous audit, using the hardened **audio-only** decode path:
-
-```powershell
-.\src\Repair-MusicLibrary.ps1 `
-    -Root "P:\Music" `
-    -RecheckAuditFailures
-```
-
-This avoids another 41k-file pass while determining how many prior failures were caused by non-audio streams such as malformed embedded artwork. Results are written to `audit\audio-only-recheck.csv`.
-
-Sample and characterize the remaining strict audio failures:
-
-```powershell
-.\src\Repair-MusicLibrary.ps1 `
-    -Root "P:\Music" `
-    -AnalyzeFailureSeverity
-```
-
-The default is five samples per normalized decoder-error signature, spread across albums where possible. The diagnostic performs a tolerant audio decode and compares decoded progress with the reported duration. Increase sampling with `-FailureSamplesPerSignature 10`.
-
-
-Apply only albums explicitly marked reviewed/approved:
+Apply reviewed and approved albums:
 
 ```powershell
 .\src\Repair-MusicLibrary.ps1 `
@@ -141,98 +125,41 @@ Apply only albums explicitly marked reviewed/approved:
     -BackupOriginals
 ```
 
-The apply path requires explicit confirmation unless `-Yes` is supplied.
+## Audit & diagnostics
 
-## Runtime data
-
-By default, state, reports, cover cache, and backups are kept outside the repository under:
-
-```text
-$HOME\Downloads\Music-Library-Repair
-```
-
-Typical runtime output includes:
-
-- `tracks.csv`
-- `albums.csv`
-- `rename-plan.csv`
-- `source-decode-audit.csv`
-- `apply-report.csv`
-- `replacement-needed.csv`
-- `decode-failures-by-extension.csv`
-- `decode-error-signatures.csv`
-- `decode-failures-by-album.csv`
-- `audit-crosscheck.csv`
-- `audio-only-recheck.csv`
-- `failure-severity-samples.csv`
-- `state.json`
-- `cover-cache\`
-- `Backups\`
-
-These are intentionally ignored by Git.
-
-## Strict decode helper
-
-A standalone strict decoder is included:
+Whole-library read-only audit:
 
 ```powershell
-.\tools\Test-MusicLibraryDecodeStrict.ps1 `
-    -Root "P:\Music"
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -AuditOnly
 ```
 
-It catches decoder failures that ordinary metadata probes can miss.
+Analyze existing reports without decoding again:
 
-## Safety model
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -AnalyzeAuditReports
+```
 
-The project treats these as separate conditions:
+Recheck only previous strict failures:
 
-- **Metadata problem** — file is healthy but tags/naming/artwork need repair.
-- **Source decode error** — file exists but audio is damaged.
-- **Missing track** — expected album content is absent.
-- **Ambiguous release** — metadata/art cannot be safely inferred.
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -RecheckAuditFailures
+```
 
-A source decode error blocks approval. The current file remains untouched until a verified replacement exists.
+Sample failure severity:
 
-See [docs/safety-model.md](docs/safety-model.md).
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -AnalyzeFailureSeverity
+```
 
-## Project status
-
-v0.6 has been exercised successfully against real multi-album collections, including:
-
-- strict preflight detection of pre-existing damaged MP3s
-- selective application to only approved clean albums
-- 2-CD filename normalization
-- embedded-cover recovery
-- exact MusicBrainz + Cover Art Archive resolution
-- post-write strict verification
-
-v0.7 development has started the first-class **bad-source replacement workflow**.
-
-The first slice is now implemented: strict source decode failures are persisted in `state.json` and exported to `replacement-needed.csv` so damaged files cannot disappear from the work queue between runs. Candidate selection and transactional replacement are the next steps.
-
-See [docs/ROADMAP.md](docs/ROADMAP.md).
-
-## Repository philosophy
-
-This repository is the development home. A tagged v1.0 release will be produced from the same source after the repair engine has earned stable status through repeated real-world use and regression testing.
-
-## License
-
-MIT. See [LICENSE.md](LICENSE.md).
-
-
-## v0.7-dev.6 failure-domain model
-
-Failure diagnostics now normalize volatile FFmpeg decoder addresses and classify messages into independent domains: `AUDIO`, `ARTWORK`, `CONTAINER`, combined domains such as `AUDIO+CONTAINER`, and `UNKNOWN`.
-
-Severity is based on actual audio completion plus the error domain. A malformed embedded PNG/JPEG that leaves audio complete is therefore an artwork-repair problem, not automatically a source-audio replacement.
-
-`-AnalyzeFailureSeverity` now reports conservative dispositions such as `RepairArtwork`, `ContainerReview`, `AudioReview`, `ManualReview`, and `ReplacementReview`.
-
-
-## v0.7-dev.7 full failure classification
-
-After validating the domain/severity model with sampling, classify every file currently present in `audit\audio-only-recheck.csv`:
+Classify every known failure:
 
 ```powershell
 .\src\Repair-MusicLibrary.ps1 `
@@ -240,35 +167,7 @@ After validating the domain/severity model with sampling, classify every file cu
     -ClassifyAuditFailures
 ```
 
-This does **not** rescan the full library and does not rerun the strict audit. It processes only the failures already identified by `-RecheckAuditFailures`, performs a tolerant audio decode for each one, then writes:
-
-- `audit\failure-classification.csv`
-- `audit\failure-classification-summary.csv`
-
-No media files or persistent repair state are modified.
-
-
-## v0.7-dev.7.1 primary vs evidence domain
-
-The classifier now distinguishes the **primary domain** implied by the canonical signature from all domains observed in FFmpeg stderr.
-
-Examples:
-
-```text
-Signature:      MP3 audio: header missing
-PrimaryDomain:  AUDIO
-EvidenceDomain: AUDIO+CONTAINER
-```
-
-```text
-Signature:      Container: invalid input data
-PrimaryDomain:  CONTAINER
-EvidenceDomain: AUDIO+CONTAINER
-```
-
-Disposition uses `PrimaryDomain + decoded completion`, while `EvidenceDomain` is retained for diagnostics.
-
-Reuse the existing full-classification measurements without decoding all failures again:
+Reclassify existing measurements without decoding again:
 
 ```powershell
 .\src\Repair-MusicLibrary.ps1 `
@@ -276,9 +175,87 @@ Reuse the existing full-classification measurements without decoding all failure
     -ReclassifyFailureDomains
 ```
 
-This writes `failure-classification-reclassified.csv` and `failure-classification-reclassified-summary.csv`.
+## Failure-domain model
 
+The classifier separates the primary problem from all FFmpeg evidence.
 
-## v0.7-dev.7.2 preflight fix
+```text
+PrimaryDomain
+  AUDIO
+  ARTWORK
+  CONTAINER
+  UNKNOWN
 
-`-ReclassifyFailureDomains` is a report-only mode and now bypasses normal ffprobe/ffmpeg preflight checks. It should start immediately, print the banner, and reuse the existing classification CSV without touching media.
+EvidenceDomain
+  AUDIO
+  ARTWORK
+  CONTAINER
+  AUDIO+CONTAINER
+  AUDIO+ARTWORK
+  ARTWORK+CONTAINER
+  ...
+```
+
+Disposition is driven by **PrimaryDomain + decoded completion**, while secondary evidence remains available for diagnostics.
+
+## Safety model
+
+| Condition | Meaning | Default behavior |
+|---|---|---|
+| Metadata problem | Audio is healthy; tags/naming need repair | Safe to plan |
+| Artwork problem | Cover data is malformed or missing | Repair artwork, preserve audio |
+| Container problem | Wrapper/input structure needs review | Review before rewriting |
+| Audio problem | Decoder reports audio-specific faults | Review severity |
+| Replacement candidate | Audio cannot be trusted safely | Block and queue |
+| Missing track | Expected album content is absent | Do not guess |
+| Ambiguous release | Exact release cannot be identified safely | Require review |
+
+See [docs/safety-model.md](docs/safety-model.md).
+
+## Runtime data
+
+Runtime state, reports, cover cache, and backups live under:
+
+```text
+$HOME\Downloads\Music-Library-Repair
+```
+
+Generated reports may contain local paths and are intentionally excluded from version control.
+
+## Strict decode helper
+
+```powershell
+.\tools\Test-MusicLibraryDecodeStrict.ps1 `
+    -Root "P:\Music"
+```
+
+## Current limitations
+
+- Apply/rewrite mode is deliberately **MP3-only**.
+- FLAC/M4A transactional apply support remains roadmap work.
+- The source-replacement workflow is under active development.
+- Pre-1.0 builds should be used with `-BackupOriginals` and an independent library backup.
+
+## Project status
+
+The v0.6 engine established the safe transactional repair foundation.
+
+The v0.7 development branch now includes replacement-needed persistence, read-only whole-library auditing, targeted failure rechecks, canonical FFmpeg signatures, primary vs evidence domains, tolerant decode severity measurement, full failure classification, and report-only reclassification.
+
+The next major step is verified replacement candidate selection, staging, transactional swap, rollback, and album re-audit.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) and [CHANGELOG.md](CHANGELOG.md).
+
+## Repository philosophy
+
+A tagged v1.0 release will be cut only after the repair engine has earned stable status through repeated real-world use, regression testing, safe rollback behavior, and verified handling of damaged media.
+
+Precision, safety, and recoverability take priority over speed.
+
+## License
+
+Released under the **MIT License**.
+
+Copyright © 2026 **Typezer∅**.
+
+See [LICENSE.md](LICENSE.md).

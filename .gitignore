@@ -1,6 +1,8 @@
 # Runtime state / reports
 Music-Library-Repair/
 **/Music-Library-Repair/
+audit/
+**/audit/
 state.json
 tracks.csv
 albums.csv
@@ -8,6 +10,18 @@ rename-plan.csv
 source-decode-audit.csv
 strict-decode-audit.csv
 apply-report.csv
+replacement-needed.csv
+decode-failures-by-extension.csv
+decode-error-signatures.csv
+decode-failures-by-album.csv
+audit-crosscheck.csv
+audio-only-recheck.csv
+failure-severity-samples.csv
+failure-classification.csv
+failure-classification-summary.csv
+failure-classification-reclassified.csv
+failure-classification-reclassified-summary.csv
+*-audit.csv
 cover-cache/
 Backups/
 backups/
