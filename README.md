@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.8-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.9-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.8**
+> Current development baseline: **v0.7-dev.9**
 
 ## Core workflow
 
@@ -193,6 +193,16 @@ repair-action-queue-summary.csv
 
 It does not decode audio, modify media, or change persistent repair state. `ReplacementReview` is a review state only; it does **not** authorize replacement.
 
+Analyze only the `ReplacementReview` subset:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -AnalyzeReplacementReview
+```
+
+This reads `repair-action-queue.csv` and writes `replacement-review-analysis.csv` plus `replacement-review-summary.csv`. It groups severe review items by decoded completion, signature, format, and evidence assessment without re-decoding audio.
+
 ## Failure-domain model
 
 The classifier separates the primary problem from all FFmpeg evidence.
@@ -276,7 +286,7 @@ Generated reports may contain local paths and are intentionally excluded from ve
 
 The v0.6 engine established the safe transactional repair foundation.
 
-The v0.7 development branch now includes replacement-needed persistence, read-only whole-library auditing, targeted failure rechecks, canonical FFmpeg signatures, primary vs evidence domains, tolerant decode severity measurement, full failure classification, report-only reclassification, and a report-only repair action queue.
+The v0.7 development branch now includes replacement-needed persistence, read-only whole-library auditing, targeted failure rechecks, canonical FFmpeg signatures, primary vs evidence domains, tolerant decode severity measurement, full failure classification, report-only reclassification, a report-only repair action queue, and a focused read-only analyzer for `ReplacementReview` items.
 
 The next major step is verified replacement candidate selection, strict candidate validation, staging, transactional swap, rollback, and album re-audit.
 

@@ -16,6 +16,7 @@ param(
     [switch]$ClassifyAuditFailures,
     [switch]$ReclassifyFailureDomains,
     [switch]$BuildRepairQueue,
+    [switch]$AnalyzeReplacementReview,
     [ValidateRange(1,50)]
     [int]$FailureSamplesPerSignature = 5
 )
@@ -23,7 +24,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.8"
+$ToolVersion = "0.7-dev.9"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -366,6 +367,172 @@ function Invoke-BuildRepairQueue {
     Write-Host "No media files were modified."
     Write-Host "Persistent repair state was NOT modified."
     Write-Host "ReplacementReview means review only; it does NOT authorize replacement."
+}
+
+
+function Invoke-AnalyzeReplacementReview {
+    param(
+        [Parameter(Mandatory)][string]$RepairQueuePath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $RepairQueuePath -PathType Leaf)) {
+        throw "Repair action queue not found: $RepairQueuePath`nRun -BuildRepairQueue first."
+    }
+
+    $queue = @(Import-Csv -LiteralPath $RepairQueuePath)
+    $rows = @(
+        $queue |
+        Where-Object { $_.RecommendedAction -eq "ReplacementReview" }
+    )
+
+    if ($rows.Count -eq 0) {
+        Write-Host "No ReplacementReview items exist in the repair action queue."
+        return
+    }
+
+    $analysisPath = Join-Path $OutputRoot "replacement-review-analysis.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-review-summary.csv"
+
+    $analysis = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($row in $rows) {
+        $reported = 0.0
+        $decoded = 0.0
+        $percent = 0.0
+        $hasReported = [double]::TryParse([string]$row.ReportedDurationSeconds, [ref]$reported)
+        $hasDecoded = [double]::TryParse([string]$row.DecodedDurationSeconds, [ref]$decoded)
+        $hasPercent = [double]::TryParse([string]$row.DecodedPercent, [ref]$percent)
+
+        $completionBand = if (-not $hasPercent) {
+            "UnknownCompletion"
+        }
+        elseif ($percent -le 5) {
+            "0-5%"
+        }
+        elseif ($percent -lt 50) {
+            "5-50%"
+        }
+        elseif ($percent -lt 90) {
+            "50-90%"
+        }
+        elseif ($percent -lt 99) {
+            "90-99%"
+        }
+        elseif ($percent -lt 99.9) {
+            "99-99.9%"
+        }
+        else {
+            "99.9%+"
+        }
+
+        $evidenceAssessment = if ([string]$row.Severity -eq "MissingFile") {
+            "SourceMissing"
+        }
+        elseif (-not $hasPercent) {
+            "NeedsMoreEvidence"
+        }
+        elseif ($percent -le 5) {
+            "VeryLowDecodedCompletion"
+        }
+        elseif ($percent -lt 90) {
+            "SubstantialDecodedLoss"
+        }
+        elseif ($percent -lt 99.9) {
+            "NearCompleteButDamaged"
+        }
+        else {
+            "CompleteOrNearlyCompleteSevereDiagnostic"
+        }
+
+        $reviewPriority = switch ($evidenceAssessment) {
+            "SourceMissing"                         { "P1" }
+            "VeryLowDecodedCompletion"              { "P1" }
+            "SubstantialDecodedLoss"                { "P1" }
+            "NearCompleteButDamaged"                { "P2" }
+            "CompleteOrNearlyCompleteSevereDiagnostic" { "P2" }
+            default                                 { "P3" }
+        }
+
+        $analysis.Add([pscustomobject]@{
+            ReviewPriority           = $reviewPriority
+            EvidenceAssessment       = $evidenceAssessment
+            CompletionBand           = $completionBand
+            Severity                 = $row.Severity
+            Signature                = $row.Signature
+            PrimaryDomain            = $row.PrimaryDomain
+            EvidenceDomain           = $row.EvidenceDomain
+            Extension                = $row.Extension
+            SourcePath               = $row.SourcePath
+            AlbumDirectory           = $row.AlbumDirectory
+            Artist                   = $row.Artist
+            AlbumArtist              = $row.AlbumArtist
+            Album                    = $row.Album
+            Date                     = $row.Date
+            Disc                     = $row.Disc
+            Track                    = $row.Track
+            Title                    = $row.Title
+            ReportedDurationSeconds  = $row.ReportedDurationSeconds
+            DecodedDurationSeconds   = $row.DecodedDurationSeconds
+            DecodedPercent           = $row.DecodedPercent
+            TolerantExitCode         = $row.TolerantExitCode
+            CandidatePath            = $row.CandidatePath
+            CandidateStatus          = $row.CandidateStatus
+        })
+    }
+
+    $analysis |
+        Sort-Object ReviewPriority, EvidenceAssessment, AlbumDirectory, Disc, Track, SourcePath |
+        Export-Csv -LiteralPath $analysisPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($category in @("ReviewPriority","EvidenceAssessment","CompletionBand","Severity","Signature","Extension")) {
+        foreach ($group in ($analysis | Group-Object $category | Sort-Object -Property @{Expression='Count';Descending=$true}, @{Expression='Name';Descending=$false})) {
+            $summary.Add([pscustomobject]@{
+                Category = $category
+                Name     = $group.Name
+                Count    = $group.Count
+            })
+        }
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT REVIEW ANALYSIS"
+    Write-Host ("=" * 72)
+    Write-Host "Input : $RepairQueuePath"
+    Write-Host "Items : $($analysis.Count)"
+
+    Write-Host ""
+    Write-Host "Evidence assessment:"
+    foreach ($group in ($analysis | Group-Object EvidenceAssessment | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-42} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Completion band:"
+    foreach ($group in ($analysis | Group-Object CompletionBand | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-20} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By signature:"
+    foreach ($group in ($analysis | Group-Object Signature | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-42} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $analysisPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "No audio was decoded."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "This analysis prioritizes review evidence only; it does NOT authorize replacement."
 }
 
 
@@ -2600,15 +2767,16 @@ $exclusiveModes = @(
         [bool]$ClassifyAuditFailures,
         [bool]$ReclassifyFailureDomains,
         [bool]$BuildRepairQueue,
+        [bool]$AnalyzeReplacementReview,
         [bool]$ApplyApproved
     ) | Where-Object { $_ }
 )
 
 if ($exclusiveModes.Count -gt 1) {
-    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, and -ApplyApproved are mutually exclusive modes."
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, and -ApplyApproved are mutually exclusive modes."
 }
 
-if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not $BuildRepairQueue -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not $BuildRepairQueue -and -not $AnalyzeReplacementReview -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
@@ -2623,7 +2791,7 @@ New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
 # Audit/report-analysis output is intentionally isolated from persistent repair
 # state so whole-library analysis cannot overwrite an in-progress review.
-$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue) { Join-Path $StateRoot "audit" } else { $StateRoot }
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -2635,12 +2803,16 @@ $DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
 $AudioOnlyRecheckReport = Join-Path $ReportRoot "audio-only-recheck.csv"
 $FailureClassificationReport = Join-Path $ReportRoot "failure-classification.csv"
 $FailureReclassifiedReport = Join-Path $ReportRoot "failure-classification-reclassified.csv"
+$RepairActionQueueReport = Join-Path $ReportRoot "repair-action-queue.csv"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($AnalyzeReplacementReview) {
+    "ANALYZE REPLACEMENT REVIEW"
 }
 elseif ($BuildRepairQueue) {
     "BUILD REPAIR QUEUE"
@@ -2668,6 +2840,13 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($AnalyzeReplacementReview) {
+    Invoke-AnalyzeReplacementReview `
+        -RepairQueuePath $RepairActionQueueReport `
+        -OutputRoot $ReportRoot
+    return
+}
 
 if ($BuildRepairQueue) {
     Invoke-BuildRepairQueue `
@@ -3164,3 +3343,4 @@ for ($a=0; $a -lt $albums.Count; $a++) {
 Write-Host ""
 Write-Host "Review complete."
 Write-Host "State: $StateFile"
+

@@ -16,6 +16,11 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `-AnalyzeReplacementReview` report-only mode for the `ReplacementReview` subset
+- `replacement-review-analysis.csv` with review priority, evidence assessment, completion band, signature, format, and track identity context
+- `replacement-review-summary.csv` grouped by priority, evidence assessment, completion band, severity, signature, and extension
+- Conservative review buckets that distinguish missing/very-low-completion files, substantial decoded loss, near-complete damaged files, and complete-or-nearly-complete severe diagnostics
+- Replacement-review analysis reuses the existing repair queue and does not decode media or modify persistent state
 - `-BuildRepairQueue` report-only mode
 - `repair-action-queue.csv` generated from the newest available reclassified/full failure classification
 - `repair-action-queue-summary.csv` grouped by action, queue status, primary domain, and severity

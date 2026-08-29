@@ -18,8 +18,16 @@ Implemented in `v0.7-dev.8`:
 - metadata enrichment from the existing audit track report
 - explicit non-destructive `ReplacementReview` state
 
+Implemented in `v0.7-dev.9`:
+
+- report-only `-AnalyzeReplacementReview`
+- replacement-review evidence/completion breakdown
+- priority bands for severe review items
+- signature/format/album identity context before candidate sourcing
+
 Next:
 
+- inspect and validate the dev.9 ReplacementReview breakdown
 - interactive replacement-candidate selection
 - strict candidate decode
 - duration/identity checks
