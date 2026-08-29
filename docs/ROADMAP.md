@@ -89,6 +89,19 @@ Implemented in `v0.7-dev.15`:
 - affected-album re-audit and status requalification
 - targeted queue-cleared assessment without rewriting historical audit reports
 
+Implemented in `v0.7-rc.1`:
+
+- isolated synthetic release-candidate regression harness
+- parser and version consistency gates
+- safe AuditOnly regression exercise
+- downgrade refusal regression
+- same- and cross-extension transactional replacement regression
+- verified backup and post-verification regression
+- release checklist for promotion to v0.7 stable
+- rc.1.1 fixes PowerShell interpolation in synthetic FFmpeg sine fixtures
+- rc.1.2 fixes the synthetic decode-report assertion field
+- rc.1.3 fixes same-extension File.Replace backup-path handling and verifies swap-backup cleanup
+
 Next:
 
 - exercise dev.11 candidate intake against known clean local replacement files

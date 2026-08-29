@@ -7,6 +7,9 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 ## [Unreleased]
 
 ### Fixed
+- Same-extension transactional replacement now supplies a real same-directory swap-backup path to `System.IO.File.Replace`, fixing Windows/.NET rejection of a null backup path; the temporary swap backup is removed after verification
+- RC harness now checks `SourceDecodeStatus` from `source-decode-audit.csv` instead of the nonexistent `Status` field
+- RC harness FFmpeg sine-source interpolation now uses `${Frequency}` so PowerShell does not parse `:duration` as part of the variable name
 - Add conservative `.mp3` forced-demuxer fallback when normal ffprobe detection fails
 - Preserve normal probe failure separately from forced probe/decode evidence
 - Classify successful fallback candidates as `CandidateForcedDemuxerReview` rather than generic probe failure or normal validation
@@ -21,6 +24,10 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `v0.7-rc.1` release-candidate hardening baseline
+- `scripts/Test-ReleaseCandidate.ps1` isolated synthetic regression harness
+- RC coverage for parser/version consistency, safe audit, strict decode reporting, downgrade refusal, same-extension replacement, cross-extension replacement, verified backups, post-verification, queue clearance, and album requalification
+- `docs/RELEASE-CHECKLIST.md` stable-promotion checklist
 - `-VerifyReplacementTransactions` read-only post-replacement verification mode
 - Automatic targeted post-verification after successful replacement commits
 - Current-state verification of source disposition, replacement existence, retained backup, SHA-256 hashes, and strict decode

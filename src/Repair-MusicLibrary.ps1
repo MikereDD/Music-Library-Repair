@@ -29,7 +29,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.15"
+$ToolVersion = "0.7-rc.1.3"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -1868,6 +1868,7 @@ function Invoke-ApplyStagedReplacements {
         $rollbackPerformed = $false
         $forcedDemuxer = $null
         $sourceRemoved = $false
+        $swapBackupPath = $null
         $sourceQualityClass = $null
         $replacementQualityClass = $null
         $qualityRelationship = $null
@@ -1961,9 +1962,19 @@ function Invoke-ApplyStagedReplacements {
                 }
 
                 if ([string]::Equals($targetPath, $sourcePath, [StringComparison]::OrdinalIgnoreCase)) {
-                    # Same-extension replacement. Replace the destination only after the
-                    # backup and replacement temp file have both been independently verified.
-                    [IO.File]::Replace($tempPath, $sourcePath, $null, $true)
+                    # Same-extension replacement. File.Replace on Windows requires a
+                    # non-empty backup path on the runtime used by the RC environment.
+                    # We already retain our authoritative verified backup separately, so
+                    # this same-directory swap backup exists only to satisfy the atomic
+                    # replace operation and is removed after the transaction verifies.
+                    $swapBackupPath = Join-Path $targetDir (
+                        ".{0}.swap-backup-{1}{2}" -f
+                            $targetStem,
+                            ([guid]::NewGuid().ToString("N")),
+                            $targetExt
+                    )
+
+                    [IO.File]::Replace($tempPath, $sourcePath, $swapBackupPath, $true)
                 }
                 else {
                     # Cross-extension replacement. First publish the verified replacement
@@ -2046,6 +2057,10 @@ function Invoke-ApplyStagedReplacements {
             finally {
                 if (Test-Path -LiteralPath $tempPath) {
                     Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                }
+                if (-not [string]::IsNullOrWhiteSpace($swapBackupPath) -and
+                    (Test-Path -LiteralPath $swapBackupPath -PathType Leaf)) {
+                    Remove-Item -LiteralPath $swapBackupPath -Force -ErrorAction SilentlyContinue
                 }
             }
         }

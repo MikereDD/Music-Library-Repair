@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.15-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--rc.1.3-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.15**
+> Current development baseline: **v0.7-rc.1.3**
 
 ## Core workflow
 
@@ -275,6 +275,16 @@ Existing committed transactions can also be rechecked without touching media:
 ```
 
 `QueueStatus=ClearedByCurrentState` means the damaged source is gone when appropriate, the replacement exists, its current hash still matches the committed hash, and strict decode passes. This targeted verifier does not rewrite historical audit reports; a later full `-AuditOnly` remains the canonical whole-library snapshot.
+
+### v0.7 release-candidate hardening
+
+`v0.7-rc.1.3` includes the isolated synthetic regression harness:
+
+```powershell
+.\scripts\Test-ReleaseCandidate.ps1
+```
+
+It never points at the real music library. It builds temporary FLAC/MP3 fixtures and tests parser/version consistency, safe audit, downgrade refusal, verified backups, same- and cross-extension replacement, post-verification, queue clearance, and album requalification. See `docs/RELEASE-CHECKLIST.md`.
 
 ## Failure-domain model
 
