@@ -1,3 +1,141 @@
+<#
+.SYNOPSIS
+Audits, reviews, repairs, and verifies a local music library with conservative,
+transactional safety gates.
+
+.DESCRIPTION
+Music-Library-Repair uses one canonical workflow:
+
+    Discover -> Audit -> Classify -> Review -> Plan -> Approve -> Apply -> Verify
+
+The tool does not treat every decoder diagnostic as proof that a track must be
+replaced. Full-library audit evidence is classified first. Replacement remains
+a separate, explicit review path.
+
+Destructive replacement requires:
+  - a verified staged candidate,
+  - ReplaceApproved=Yes in replacement-candidate-intake.csv,
+  - -BackupOriginals,
+  - -Yes,
+  - and, for a known lossless-to-lossy replacement,
+    QualityDowngradeApproved=Yes.
+
+Every committed replacement is backed up and hash-verified before source
+replacement. The replacement is hash-verified and strict-decoded before the
+transaction is accepted.
+
+.PARAMETER Root
+Root folder containing the music library to inspect or repair.
+
+.PARAMETER StateRoot
+Runtime state and report directory. Defaults to:
+$HOME\Downloads\Music-Library-Repair
+
+.PARAMETER AuditOnly
+Runs a non-destructive whole-library audit. Persistent repair state is not
+modified.
+
+.PARAMETER AnalyzeAuditReports
+Analyzes previously generated audit reports without modifying media.
+
+.PARAMETER RecheckAuditFailures
+Rechecks previously failed audit items.
+
+.PARAMETER AnalyzeFailureSeverity
+Measures failure severity from the generated audit evidence.
+
+.PARAMETER ClassifyAuditFailures
+Classifies audit failures into evidence/action domains.
+
+.PARAMETER ReclassifyFailureDomains
+Rebuilds PrimaryDomain independently from the broader EvidenceDomain.
+
+.PARAMETER BuildRepairQueue
+Builds the classification-aware repair-action queue. This queue, not raw decode
+failure observation, determines whether an item enters ReplacementReview,
+ContainerReview, AudioReview, or artwork repair.
+
+.PARAMETER AnalyzeReplacementReview
+Analyzes only items classified for ReplacementReview.
+
+.PARAMETER AnalyzeReplacementEvidence
+Performs targeted evidence gathering for replacement-review items.
+
+.PARAMETER ReviewReplacementCandidates
+Builds/preserves the candidate intake sheet and validates supplied candidates.
+
+.PARAMETER StageReplacementCandidates
+Copies explicitly approved candidates into isolated staging and verifies their
+hash and strict decode status. Source media is not replaced.
+
+.PARAMETER ApplyStagedReplacements
+Applies only explicitly approved, verified staged replacements. Requires
+-BackupOriginals and -Yes.
+
+.PARAMETER VerifyReplacementTransactions
+Read-only verification of previously committed replacement transactions,
+including current hash/decode state, backup integrity, queue clearance, and
+affected-album requalification.
+
+.PARAMETER BackupOriginals
+Required safety switch for destructive apply modes that support backup.
+
+.PARAMETER Yes
+Required explicit confirmation switch for destructive replacement.
+
+.PARAMETER SkipSourceDecodeAudit
+Skips the strict source decode audit where supported.
+
+.PARAMETER Resume
+Resumes interactive review state for the supplied Root.
+
+.PARAMETER ApplyApproved
+Applies previously approved metadata/artwork plans. This is separate from
+ApplyStagedReplacements.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -AuditOnly
+
+Runs a non-destructive full-library audit.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -BuildRepairQueue
+
+Builds the classification-aware repair queue from existing audit/classification
+reports.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -ReviewReplacementCandidates
+
+Creates or refreshes replacement candidate intake/validation reports.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -StageReplacementCandidates
+
+Stages only candidates with StageApproved=Yes and verifies the staged copy.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -ApplyStagedReplacements -BackupOriginals -Yes
+
+Runs the destructive replacement transaction path. Individual replacements
+still require ReplaceApproved=Yes, and known lossless-to-lossy replacements
+also require QualityDowngradeApproved=Yes.
+
+.EXAMPLE
+.\src\Repair-MusicLibrary.ps1 -Root "P:\Music" -VerifyReplacementTransactions
+
+Performs read-only post-replacement verification.
+
+.NOTES
+Requires PowerShell 7+, ffmpeg, and ffprobe.
+
+See:
+  docs\USAGE.md
+  docs\REPORTS.md
+  docs\RECOVERY.md
+  docs\TROUBLESHOOTING.md
+  docs\ARCHITECTURE.md
+#>
 #requires -Version 7.0
 [CmdletBinding()]
 param(
@@ -8,13 +146,28 @@ param(
     [switch]$ApplyApproved,
     [switch]$BackupOriginals,
     [switch]$Yes,
-    [switch]$SkipSourceDecodeAudit
+    [switch]$SkipSourceDecodeAudit,
+    [switch]$AuditOnly,
+    [switch]$AnalyzeAuditReports,
+    [switch]$RecheckAuditFailures,
+    [switch]$AnalyzeFailureSeverity,
+    [switch]$ClassifyAuditFailures,
+    [switch]$ReclassifyFailureDomains,
+    [switch]$BuildRepairQueue,
+    [switch]$AnalyzeReplacementReview,
+    [switch]$AnalyzeReplacementEvidence,
+    [switch]$ReviewReplacementCandidates,
+    [switch]$StageReplacementCandidates,
+    [switch]$ApplyStagedReplacements,
+    [switch]$VerifyReplacementTransactions,
+    [ValidateRange(1,50)]
+    [int]$FailureSamplesPerSignature = 5
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.6"
+$ToolVersion = "0.7-rc.2.1"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -81,8 +234,12 @@ function Test-SourceAudioDecode {
     )
 
     $output = @(
+        # Disable video/subtitle/data processing at the input as well as the
+        # output. This is important for MP3/FLAC files carrying malformed
+        # attached artwork: bad cover art must not become SOURCE AUDIO ERROR.
         & ffmpeg -hide_banner -v error -xerror -err_detect explode `
-            -i $File.FullName -map 0:a:0 -f null - 2>&1
+            -vn -sn -dn -i $File.FullName `
+            -map 0:a:0 -vn -sn -dn -f null - 2>&1
     )
 
     $exit = $LASTEXITCODE
@@ -92,6 +249,3481 @@ function Test-SourceAudioDecode {
         ExitCode  = $exit
         ErrorText = ($output -join " | ")
     }
+}
+
+
+function Sync-ReplacementQueue {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IEnumerable]$Tracks,
+        [Parameter(Mandatory)]
+        [hashtable]$State
+    )
+
+    if (-not $State.ContainsKey("replacements") -or $null -eq $State.replacements) {
+        $State.replacements = @{}
+    }
+
+    if ($SkipSourceDecodeAudit) {
+        return
+    }
+
+    $now = (Get-Date).ToString("o")
+    $activeFailures = @(
+        $Tracks |
+        Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" }
+    )
+
+    $activePaths = @{}
+    foreach ($track in $activeFailures) {
+        $activePaths[$track.Path] = $true
+
+        if ($State.replacements.ContainsKey($track.Path)) {
+            $item = $State.replacements[$track.Path]
+
+            # Keep first-detected history and any future workflow fields already
+            # present in state, while refreshing the current audit evidence.
+            $item.AlbumDirectory = $track.Directory
+            $item.FileName = $track.FileName
+            $item.Artist = $track.Artist
+            $item.Album = $track.Album
+            $item.Date = $track.Date
+            $item.Disc = $track.Disc
+            $item.Track = $track.Track
+            $item.Title = $track.Title
+            $item.DecodeExitCode = $track.SourceDecodeExitCode
+            $item.DecodeError = $track.SourceDecodeError
+            $item.LastDetectedAt = $now
+
+            if (-not $item.ContainsKey("FirstDetectedAt") -or -not $item.FirstDetectedAt) {
+                $item.FirstDetectedAt = $now
+            }
+
+            # Raw strict-decode evidence is observation only. Replacement
+            # authorization comes later from the classification-aware repair
+            # queue (ReplacementReview), never from this persistent observation.
+            if (-not $item.ContainsKey("Status") -or
+                [string]::IsNullOrWhiteSpace([string]$item.Status) -or
+                $item.Status -in @("Needed","NoLongerFailing","NoLongerObserved")) {
+                $item.Status = "ObservedDecodeFailure"
+            }
+        }
+        else {
+            $State.replacements[$track.Path] = @{
+                SourcePath       = $track.Path
+                AlbumDirectory   = $track.Directory
+                FileName         = $track.FileName
+                Artist           = $track.Artist
+                Album            = $track.Album
+                Date             = $track.Date
+                Disc             = $track.Disc
+                Track            = $track.Track
+                Title            = $track.Title
+                DecodeExitCode   = $track.SourceDecodeExitCode
+                DecodeError      = $track.SourceDecodeError
+                Status           = "ObservedDecodeFailure"
+                CandidatePath    = $null
+                CandidateStatus  = $null
+                FirstDetectedAt  = $now
+                LastDetectedAt   = $now
+                ResolvedAt       = $null
+            }
+        }
+    }
+
+    # Preserve queue history. If an item previously failed but no longer does,
+    # do not delete it; mark that fact for later replacement-workflow logic.
+    foreach ($key in @($State.replacements.Keys)) {
+        $item = $State.replacements[$key]
+        if ($item.SourcePath -and
+            $item.SourcePath.StartsWith($Root, [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not $activePaths.ContainsKey($item.SourcePath) -and
+            $item.Status -in @("Needed","ObservedDecodeFailure")) {
+            $item.Status = "NoLongerObserved"
+        }
+    }
+}
+
+function Export-ReplacementQueue {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$State,
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $rows = @(
+        foreach ($item in $State.replacements.Values) {
+            [pscustomobject]@{
+                Status                = $item.Status
+                ObservationOnly       = $true
+                ReplacementAuthorized = $false
+                SourcePath            = $item.SourcePath
+                AlbumDirectory  = $item.AlbumDirectory
+                Artist          = $item.Artist
+                Album           = $item.Album
+                Date            = $item.Date
+                Disc            = $item.Disc
+                Track           = $item.Track
+                Title           = $item.Title
+                FileName        = $item.FileName
+                DecodeExitCode  = $item.DecodeExitCode
+                DecodeError     = $item.DecodeError
+                CandidatePath   = $item.CandidatePath
+                CandidateStatus = $item.CandidateStatus
+                FirstDetectedAt = $item.FirstDetectedAt
+                LastDetectedAt  = $item.LastDetectedAt
+                ResolvedAt      = $item.ResolvedAt
+            }
+        }
+    )
+
+    $rows |
+        Sort-Object AlbumDirectory, Disc, Track, FileName |
+        Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+}
+
+
+
+function Invoke-BuildRepairQueue {
+    param(
+        [Parameter(Mandatory)][string]$OutputRoot,
+        [Parameter(Mandatory)][string]$ReclassifiedReportPath,
+        [Parameter(Mandatory)][string]$ClassificationReportPath,
+        [Parameter(Mandatory)][string]$TrackReportPath
+    )
+
+    $inputPath = $null
+
+    if (Test-Path -LiteralPath $ReclassifiedReportPath -PathType Leaf) {
+        $inputPath = $ReclassifiedReportPath
+    }
+    elseif (Test-Path -LiteralPath $ClassificationReportPath -PathType Leaf) {
+        $inputPath = $ClassificationReportPath
+    }
+    else {
+        throw "No failure classification report exists.`nRun -ClassifyAuditFailures and then -ReclassifyFailureDomains first."
+    }
+
+    $rows = @(Import-Csv -LiteralPath $inputPath)
+
+    if ($rows.Count -eq 0) {
+        Write-Host "Failure classification report is empty."
+        return
+    }
+
+    $trackByPath = @{}
+    if (Test-Path -LiteralPath $TrackReportPath -PathType Leaf) {
+        foreach ($track in @(Import-Csv -LiteralPath $TrackReportPath)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$track.Path)) {
+                $trackByPath[[string]$track.Path] = $track
+            }
+        }
+    }
+
+    $queuePath = Join-Path $OutputRoot "repair-action-queue.csv"
+    $summaryPath = Join-Path $OutputRoot "repair-action-queue-summary.csv"
+    $queue = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($row in $rows) {
+        $path = [string]$row.Path
+        $track = if ($trackByPath.ContainsKey($path)) { $trackByPath[$path] } else { $null }
+        $action = [string]$row.Action
+
+        $queueStatus = switch ($action) {
+            "ReplacementReview" { "PendingReplacementReview" }
+            "RepairArtwork"     { "PendingArtworkRepair" }
+            "ContainerReview"   { "PendingContainerReview" }
+            "AudioReview"       { "PendingAudioReview" }
+            "LocateFile"        { "PendingLocateFile" }
+            default             { "PendingManualReview" }
+        }
+
+        $queue.Add([pscustomobject]@{
+            QueueStatus             = $queueStatus
+            RecommendedAction       = $action
+            PrimaryDomain           = $row.PrimaryDomain
+            EvidenceDomain          = $row.EvidenceDomain
+            Severity                = $row.Severity
+            Signature               = $row.Signature
+            SourcePath              = $path
+            AlbumDirectory          = if ($track) { $track.Directory } else { $row.Directory }
+            FileName                = if ($track) { $track.FileName } else { $row.FileName }
+            Extension               = if ($track) { $track.Extension } else { $row.Extension }
+            Artist                  = if ($track) { $track.Artist } else { $null }
+            AlbumArtist             = if ($track) { $track.AlbumArtist } else { $null }
+            Album                   = if ($track) { $track.Album } else { $null }
+            Date                    = if ($track) { $track.Date } else { $null }
+            Disc                    = if ($track) { $track.Disc } else { $null }
+            Track                   = if ($track) { $track.Track } else { $null }
+            Title                   = if ($track) { $track.Title } else { $null }
+            ReportedDurationSeconds = $row.ReportedDurationSeconds
+            DecodedDurationSeconds  = $row.DecodedDurationSeconds
+            DecodedPercent          = $row.DecodedPercent
+            TolerantExitCode        = $row.TolerantExitCode
+            CandidatePath           = $null
+            CandidateStatus         = $null
+        })
+    }
+
+    $queue |
+        Sort-Object RecommendedAction, PrimaryDomain, AlbumDirectory, Disc, Track, FileName |
+        Export-Csv -LiteralPath $queuePath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($category in @("RecommendedAction","QueueStatus","PrimaryDomain","Severity")) {
+        foreach ($group in ($queue | Group-Object $category | Sort-Object Count -Descending)) {
+            $summary.Add([pscustomobject]@{
+                Category = $category
+                Name     = $group.Name
+                Count    = $group.Count
+            })
+        }
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPAIR ACTION QUEUE BUILT"
+    Write-Host ("=" * 72)
+    Write-Host "Input : $inputPath"
+    Write-Host "Items : $($queue.Count)"
+
+    Write-Host ""
+    Write-Host "Recommended action:"
+    foreach ($group in ($queue | Group-Object RecommendedAction | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-26} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Queue status:"
+    foreach ($group in ($queue | Group-Object QueueStatus | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-30} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $queuePath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "No audio was decoded."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "ReplacementReview means review only; it does NOT authorize replacement."
+}
+
+
+function Invoke-AnalyzeReplacementReview {
+    param(
+        [Parameter(Mandatory)][string]$RepairQueuePath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $RepairQueuePath -PathType Leaf)) {
+        throw "Repair action queue not found: $RepairQueuePath`nRun -BuildRepairQueue first."
+    }
+
+    $queue = @(Import-Csv -LiteralPath $RepairQueuePath)
+    $rows = @(
+        $queue |
+        Where-Object { $_.RecommendedAction -eq "ReplacementReview" }
+    )
+
+    if ($rows.Count -eq 0) {
+        Write-Host "No ReplacementReview items exist in the repair action queue."
+        return
+    }
+
+    $analysisPath = Join-Path $OutputRoot "replacement-review-analysis.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-review-summary.csv"
+
+    $analysis = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($row in $rows) {
+        $reported = 0.0
+        $decoded = 0.0
+        $percent = 0.0
+        $hasReported = [double]::TryParse([string]$row.ReportedDurationSeconds, [ref]$reported)
+        $hasDecoded = [double]::TryParse([string]$row.DecodedDurationSeconds, [ref]$decoded)
+        $hasPercent = [double]::TryParse([string]$row.DecodedPercent, [ref]$percent)
+
+        $completionBand = if (-not $hasPercent) {
+            "UnknownCompletion"
+        }
+        elseif ($percent -le 5) {
+            "0-5%"
+        }
+        elseif ($percent -lt 50) {
+            "5-50%"
+        }
+        elseif ($percent -lt 90) {
+            "50-90%"
+        }
+        elseif ($percent -lt 99) {
+            "90-99%"
+        }
+        elseif ($percent -lt 99.9) {
+            "99-99.9%"
+        }
+        else {
+            "99.9%+"
+        }
+
+        $evidenceAssessment = if ([string]$row.Severity -eq "MissingFile") {
+            "SourceMissing"
+        }
+        elseif (-not $hasPercent) {
+            "NeedsMoreEvidence"
+        }
+        elseif ($percent -le 5) {
+            "VeryLowDecodedCompletion"
+        }
+        elseif ($percent -lt 90) {
+            "SubstantialDecodedLoss"
+        }
+        elseif ($percent -lt 99.9) {
+            "NearCompleteButDamaged"
+        }
+        else {
+            "CompleteOrNearlyCompleteSevereDiagnostic"
+        }
+
+        $reviewPriority = switch ($evidenceAssessment) {
+            "SourceMissing"                         { "P1" }
+            "VeryLowDecodedCompletion"              { "P1" }
+            "SubstantialDecodedLoss"                { "P1" }
+            "NearCompleteButDamaged"                { "P2" }
+            "CompleteOrNearlyCompleteSevereDiagnostic" { "P2" }
+            default                                 { "P3" }
+        }
+
+        $analysis.Add([pscustomobject]@{
+            ReviewPriority           = $reviewPriority
+            EvidenceAssessment       = $evidenceAssessment
+            CompletionBand           = $completionBand
+            Severity                 = $row.Severity
+            Signature                = $row.Signature
+            PrimaryDomain            = $row.PrimaryDomain
+            EvidenceDomain           = $row.EvidenceDomain
+            Extension                = $row.Extension
+            SourcePath               = $row.SourcePath
+            AlbumDirectory           = $row.AlbumDirectory
+            Artist                   = $row.Artist
+            AlbumArtist              = $row.AlbumArtist
+            Album                    = $row.Album
+            Date                     = $row.Date
+            Disc                     = $row.Disc
+            Track                    = $row.Track
+            Title                    = $row.Title
+            ReportedDurationSeconds  = $row.ReportedDurationSeconds
+            DecodedDurationSeconds   = $row.DecodedDurationSeconds
+            DecodedPercent           = $row.DecodedPercent
+            TolerantExitCode         = $row.TolerantExitCode
+            CandidatePath            = $row.CandidatePath
+            CandidateStatus          = $row.CandidateStatus
+        })
+    }
+
+    $analysis |
+        Sort-Object ReviewPriority, EvidenceAssessment, AlbumDirectory, Disc, Track, SourcePath |
+        Export-Csv -LiteralPath $analysisPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($category in @("ReviewPriority","EvidenceAssessment","CompletionBand","Severity","Signature","Extension")) {
+        foreach ($group in ($analysis | Group-Object $category | Sort-Object -Property @{Expression='Count';Descending=$true}, @{Expression='Name';Descending=$false})) {
+            $summary.Add([pscustomobject]@{
+                Category = $category
+                Name     = $group.Name
+                Count    = $group.Count
+            })
+        }
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT REVIEW ANALYSIS"
+    Write-Host ("=" * 72)
+    Write-Host "Input : $RepairQueuePath"
+    Write-Host "Items : $($analysis.Count)"
+
+    Write-Host ""
+    Write-Host "Evidence assessment:"
+    foreach ($group in ($analysis | Group-Object EvidenceAssessment | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-42} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Completion band:"
+    foreach ($group in ($analysis | Group-Object CompletionBand | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-20} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By signature:"
+    foreach ($group in ($analysis | Group-Object Signature | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-42} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $analysisPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "No audio was decoded."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "This analysis prioritizes review evidence only; it does NOT authorize replacement."
+}
+
+
+function Invoke-AnalyzeReplacementEvidence {
+    param(
+        [Parameter(Mandatory)][string]$ReplacementReviewAnalysisPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $ReplacementReviewAnalysisPath -PathType Leaf)) {
+        throw "Replacement-review analysis not found: $ReplacementReviewAnalysisPath`nRun -AnalyzeReplacementReview first."
+    }
+
+    $sourceRows = @(
+        Import-Csv -LiteralPath $ReplacementReviewAnalysisPath |
+        Where-Object { $_.EvidenceAssessment -eq "NeedsMoreEvidence" }
+    )
+
+    if ($sourceRows.Count -eq 0) {
+        Write-Host "No NeedsMoreEvidence replacement-review items remain."
+        return
+    }
+
+    $detailPath = Join-Path $OutputRoot "replacement-evidence-analysis.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-evidence-summary.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    $index = 0
+    foreach ($row in $sourceRows) {
+        $index++
+        $path = [string]$row.SourcePath
+        Write-Host ("[{0}/{1}] {2}" -f $index,$sourceRows.Count,$path)
+
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                EvidenceResolution       = "MissingSourcePath"
+                ReplacementConfidence    = "High"
+                ProbeStatus              = "Missing"
+                TargetedDecodeStatus     = "NotRun"
+                OriginalSignature        = $row.Signature
+                TargetedSignature        = $null
+                Extension                = $row.Extension
+                SourcePath               = $path
+                AlbumDirectory           = $row.AlbumDirectory
+                Artist                   = $row.Artist
+                AlbumArtist              = $row.AlbumArtist
+                Album                    = $row.Album
+                Date                     = $row.Date
+                Disc                     = $row.Disc
+                Track                    = $row.Track
+                Title                    = $row.Title
+                ReportedDurationSeconds  = $null
+                DecodedDurationSeconds   = $null
+                DecodedPercent           = $null
+                TolerantExitCode         = $null
+                DiagnosticNote           = "Source path is missing."
+            })
+            continue
+        }
+
+        $reported = Get-ReportedAudioDurationSeconds -Path $path
+        $diag = Invoke-TolerantAudioDecodeDiagnostic -Path $path
+        $decoded = [double]$diag.DecodedSeconds
+
+        $percent = $null
+        if ($null -ne $reported -and [double]$reported -gt 0) {
+            $percent = [math]::Round((100.0 * $decoded / [double]$reported), 3)
+        }
+
+        $probeStatus = if ($null -eq $reported) { "DurationUnavailable" } else { "DurationAvailable" }
+        $decodeStatus = if ([int]$diag.ExitCode -eq 0) { "Completed" } else { "Error" }
+
+        $originalSignature = [string]$row.Signature
+        $targetedSignature = [string]$diag.ErrorSignature
+        $looksLikeContainerOrHeader = (
+            $originalSignature -like "Container:*" -or
+            $originalSignature -eq "MP3 audio: header missing" -or
+            $targetedSignature -like "Container:*" -or
+            $targetedSignature -eq "MP3 audio: header missing"
+        )
+
+        $resolution = "NeedsManualInspection"
+        $confidence = "Low"
+        $note = "Targeted evidence remains ambiguous."
+
+        if ($null -eq $reported) {
+            if ([int]$diag.ExitCode -eq 0 -and $decoded -gt 0) {
+                $resolution = "AudioDecodesButDurationUnknown"
+                $confidence = "Low"
+                $note = "Audio completed a tolerant decode, but ffprobe could not supply duration."
+            }
+            elseif ($decoded -le 0) {
+                $resolution = "UnreadableMediaSource"
+                $confidence = "High"
+                $note = "Source exists, but ffprobe cannot determine duration and tolerant decode cannot recover measurable audio."
+            }
+            elseif ($looksLikeContainerOrHeader) {
+                $resolution = "ContainerOrHeaderFailure"
+                $confidence = "Medium"
+                $note = "Some audio decoded, but container/header diagnostics prevent a trustworthy duration comparison."
+            }
+            else {
+                $resolution = "ProbeDurationUnavailable"
+                $confidence = "Low"
+                $note = "ffprobe duration is unavailable and the targeted decode still returned an error."
+            }
+        }
+        else {
+            if ($null -ne $percent -and $percent -lt 95.0) {
+                $resolution = "ConfirmedSevereAudioDamage"
+                $confidence = "High"
+                $note = "Targeted tolerant decode recovered less than 95% of the reported duration."
+            }
+            elseif ($looksLikeContainerOrHeader -and [int]$diag.ExitCode -ne 0) {
+                $resolution = "ContainerOrHeaderFailure"
+                $confidence = "Medium"
+                $note = "Most audio is recoverable, but container/header diagnostics remain."
+            }
+            elseif ([int]$diag.ExitCode -eq 0 -and $null -ne $percent -and $percent -ge 99.9) {
+                $resolution = "NeedsManualInspection"
+                $confidence = "Low"
+                $note = "Targeted tolerant decode now completes essentially the full reported duration."
+            }
+        }
+
+        $results.Add([pscustomobject]@{
+            EvidenceResolution       = $resolution
+            ReplacementConfidence    = $confidence
+            ProbeStatus              = $probeStatus
+            TargetedDecodeStatus     = $decodeStatus
+            OriginalSignature        = $originalSignature
+            TargetedSignature        = $targetedSignature
+            Extension                = $row.Extension
+            SourcePath               = $path
+            AlbumDirectory           = $row.AlbumDirectory
+            Artist                   = $row.Artist
+            AlbumArtist              = $row.AlbumArtist
+            Album                    = $row.Album
+            Date                     = $row.Date
+            Disc                     = $row.Disc
+            Track                    = $row.Track
+            Title                    = $row.Title
+            ReportedDurationSeconds  = $reported
+            DecodedDurationSeconds   = $decoded
+            DecodedPercent           = $percent
+            TolerantExitCode         = $diag.ExitCode
+            DiagnosticNote           = $note
+        })
+    }
+
+    $results |
+        Sort-Object EvidenceResolution, ReplacementConfidence, AlbumDirectory, Disc, Track, SourcePath |
+        Export-Csv -LiteralPath $detailPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($category in @(
+        "EvidenceResolution",
+        "ReplacementConfidence",
+        "ProbeStatus",
+        "TargetedDecodeStatus",
+        "OriginalSignature",
+        "TargetedSignature",
+        "Extension"
+    )) {
+        foreach ($group in ($results | Group-Object $category | Sort-Object Count -Descending)) {
+            $summary.Add([pscustomobject]@{
+                Category = $category
+                Name     = $group.Name
+                Count    = $group.Count
+            })
+        }
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT EVIDENCE ANALYSIS"
+    Write-Host ("=" * 72)
+    Write-Host "Input : $ReplacementReviewAnalysisPath"
+    Write-Host "Items : $($results.Count)"
+
+    Write-Host ""
+    Write-Host "Evidence resolution:"
+    foreach ($group in ($results | Group-Object EvidenceResolution | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-38} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Replacement confidence:"
+    foreach ($group in ($results | Group-Object ReplacementConfidence | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-20} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $detailPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "Only the NeedsMoreEvidence subset was targeted."
+    Write-Host "Audio was decoded for diagnosis only."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "High replacement confidence still means review; it does NOT authorize replacement."
+}
+
+
+function Get-CandidateForcedDemuxer {
+    param([Parameter(Mandatory)][System.IO.FileInfo]$File)
+
+    switch ($File.Extension.ToLowerInvariant()) {
+        ".mp3" { return "mp3" }
+        default { return $null }
+    }
+}
+
+function Get-FFProbeInfoForced {
+    param(
+        [Parameter(Mandatory)][System.IO.FileInfo]$File,
+        [Parameter(Mandatory)][string]$Demuxer
+    )
+
+    try {
+        $text = @(
+            & ffprobe -v quiet -f $Demuxer -print_format json -show_format -show_streams -- $File.FullName
+        )
+        if ($LASTEXITCODE -ne 0 -or -not $text) {
+            throw "forced ffprobe ($Demuxer) failed with exit code $LASTEXITCODE"
+        }
+
+        $json = ($text -join [Environment]::NewLine) | ConvertFrom-Json
+        $tags = $json.format.tags
+        $embedded = @($json.streams | Where-Object {
+            $_.codec_type -eq "video" -and
+            $null -ne $_.disposition -and
+            $_.disposition.attached_pic -eq 1
+        })
+
+        $duration = $null
+        $parsedDuration = 0.0
+        if ($json.format -and
+            -not [string]::IsNullOrWhiteSpace([string]$json.format.duration) -and
+            [double]::TryParse(
+                [string]$json.format.duration,
+                [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsedDuration
+            )) {
+            $duration = $parsedDuration
+        }
+
+        [pscustomobject]@{
+            Path=$File.FullName
+            Directory=$File.DirectoryName
+            FileName=$File.Name
+            Extension=$File.Extension.ToLowerInvariant()
+            Title=(Get-TagValue $tags @("title"))
+            Artist=(Get-TagValue $tags @("artist"))
+            AlbumArtist=(Get-TagValue $tags @("album_artist","albumartist","album artist"))
+            Album=(Get-TagValue $tags @("album"))
+            TrackRaw=(Get-TagValue $tags @("track"))
+            Track=(Get-NumberPart (Get-TagValue $tags @("track")))
+            DiscRaw=(Get-TagValue $tags @("disc","discnumber"))
+            Disc=(Get-NumberPart (Get-TagValue $tags @("disc","discnumber")))
+            Date=(Get-TagValue $tags @("date","year"))
+            Genre=(Get-TagValue $tags @("genre"))
+            EmbeddedCover=($embedded.Count -gt 0)
+            CoverCount=$embedded.Count
+            DurationSeconds=$duration
+            ForcedDemuxer=$Demuxer
+            ProbeError=$null
+        }
+    }
+    catch {
+        [pscustomobject]@{
+            Path=$File.FullName; Directory=$File.DirectoryName; FileName=$File.Name; Extension=$File.Extension.ToLowerInvariant()
+            Title=$null; Artist=$null; AlbumArtist=$null; Album=$null; TrackRaw=$null; Track=$null; DiscRaw=$null; Disc=$null
+            Date=$null; Genre=$null; EmbeddedCover=$false; CoverCount=0; DurationSeconds=$null
+            ForcedDemuxer=$Demuxer; ProbeError=$_.Exception.Message
+        }
+    }
+}
+
+function Test-CandidateAudioDecodeForced {
+    param(
+        [Parameter(Mandatory)][System.IO.FileInfo]$File,
+        [Parameter(Mandatory)][string]$Demuxer
+    )
+
+    $output = @(
+        & ffmpeg -hide_banner -v error -xerror -err_detect explode `
+            -f $Demuxer -i $File.FullName `
+            -map 0:a:0 -vn -sn -dn -f null - 2>&1
+    )
+
+    $exit = $LASTEXITCODE
+
+    [pscustomobject]@{
+        Clean         = ($exit -eq 0 -and $output.Count -eq 0)
+        ExitCode      = $exit
+        ErrorText     = ($output -join " | ")
+        ForcedDemuxer = $Demuxer
+    }
+}
+
+function ConvertTo-IdentityKey {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    $s = $Value.Normalize([Text.NormalizationForm]::FormD)
+    $chars = foreach ($c in $s.ToCharArray()) {
+        $category = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($c)
+        if ($category -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            $c
+        }
+    }
+
+    $s = (-join $chars).Normalize([Text.NormalizationForm]::FormC).ToLowerInvariant()
+    $s = $s -replace '&', ' and '
+    $s = $s -replace '[^a-z0-9]+', ' '
+    $s = $s -replace '\s+', ' '
+    return $s.Trim()
+}
+
+
+function Get-ExpectedReplacementIdentity {
+    param(
+        [Parameter(Mandatory)]$Item
+    )
+
+    $sourcePath = [string]$Item.SourcePath
+    $leaf = [IO.Path]::GetFileNameWithoutExtension($sourcePath)
+    $dir = [IO.Path]::GetDirectoryName($sourcePath)
+    $parent = if ($dir) { Split-Path -Leaf $dir } else { $null }
+    $grandparentPath = if ($dir) { Split-Path -Parent $dir } else { $null }
+    $grandparent = if ($grandparentPath) { Split-Path -Leaf $grandparentPath } else { $null }
+
+    $artist = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Artist)) { [string]$Item.Artist } else { $null }
+    $album = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Album)) { [string]$Item.Album } else { $null }
+    $title = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Title)) { [string]$Item.Title } else { $null }
+    $track = $null
+    $disc = $null
+    $date = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Date)) { [string]$Item.Date } else { $null }
+
+    $artistSource = if ($artist) { "SourceTag" } else { $null }
+    $albumSource = if ($album) { "SourceTag" } else { $null }
+    $titleSource = if ($title) { "SourceTag" } else { $null }
+    $trackSource = $null
+    $discSource = $null
+    $dateSource = if ($date) { "SourceTag" } else { $null }
+
+    $n = 0
+    if ([int]::TryParse([string]$Item.Track, [ref]$n)) {
+        $track = $n
+        $trackSource = "SourceTag"
+    }
+
+    $n = 0
+    if ([int]::TryParse([string]$Item.Disc, [ref]$n)) {
+        $disc = $n
+        $discSource = "SourceTag"
+    }
+
+    # Reconstruct track/title from common filename patterns only when missing.
+    if (-not $track -or -not $title) {
+        $m = [regex]::Match($leaf, '^(?<track>\d{1,3})\s*[-._ ]+\s*(?<title>.+)$')
+        if ($m.Success) {
+            if (-not $track) {
+                $track = [int]$m.Groups["track"].Value
+                $trackSource = "FileName"
+            }
+            if (-not $title) {
+                $title = $m.Groups["title"].Value.Trim()
+                $titleSource = "FileName"
+            }
+        }
+    }
+
+    # Canonical single-disc pattern: Track - Artist - Title
+    if (-not $artist -or -not $track -or -not $title) {
+        $m = [regex]::Match($leaf, '^(?<track>\d{1,3})\s*-\s*(?<artist>.+?)\s*-\s*(?<title>.+)$')
+        if ($m.Success) {
+            if (-not $track) {
+                $track = [int]$m.Groups["track"].Value
+                $trackSource = "FileName"
+            }
+            if (-not $artist) {
+                $artist = $m.Groups["artist"].Value.Trim()
+                $artistSource = "FileName"
+            }
+            if (-not $title) {
+                $title = $m.Groups["title"].Value.Trim()
+                $titleSource = "FileName"
+            }
+        }
+    }
+
+    # Canonical multi-disc pattern: Disc-Track - Artist - Title
+    if (-not $artist -or -not $disc -or -not $track -or -not $title) {
+        $m = [regex]::Match($leaf, '^(?<disc>\d{1,2})-(?<track>\d{1,3})\s*-\s*(?<artist>.+?)\s*-\s*(?<title>.+)$')
+        if ($m.Success) {
+            if (-not $disc) {
+                $disc = [int]$m.Groups["disc"].Value
+                $discSource = "FileName"
+            }
+            if (-not $track) {
+                $track = [int]$m.Groups["track"].Value
+                $trackSource = "FileName"
+            }
+            if (-not $artist) {
+                $artist = $m.Groups["artist"].Value.Trim()
+                $artistSource = "FileName"
+            }
+            if (-not $title) {
+                $title = $m.Groups["title"].Value.Trim()
+                $titleSource = "FileName"
+            }
+        }
+    }
+
+    # Infer album from the containing folder when source tags are missing.
+    if (-not $album -and $parent) {
+        $candidateAlbum = $parent
+        $candidateAlbum = $candidateAlbum -replace '^\s*[^-]+-\s*', ''
+        $candidateAlbum = $candidateAlbum -replace '\s*\((?:19|20)\d{2}\)\s*$', ''
+        $candidateAlbum = $candidateAlbum -replace '^\s*\[(?:19|20)\d{2}\]\s*', ''
+        if (-not [string]::IsNullOrWhiteSpace($candidateAlbum)) {
+            $album = $candidateAlbum.Trim()
+            $albumSource = "ParentFolder"
+        }
+    }
+
+    # Infer artist from common artist/album directory layout.
+    if (-not $artist -and $grandparent) {
+        $candidateArtist = $grandparent
+        if ($candidateArtist -notmatch '^(Music|Rock|Pop|HipHop|HipHop-Rap|Country-Folk|Electro|World|Indie|Blues-Jazz-Soul)$') {
+            $artist = $candidateArtist.Trim()
+            $artistSource = "GrandparentFolder"
+        }
+    }
+
+    # Pull a year from the album folder if source date is unavailable.
+    if (-not $date -and $parent) {
+        $m = [regex]::Match($parent, '(?<year>(?:19|20)\d{2})')
+        if ($m.Success) {
+            $date = $m.Groups["year"].Value
+            $dateSource = "ParentFolder"
+        }
+    }
+
+    [pscustomobject]@{
+        Artist       = $artist
+        ArtistSource = $artistSource
+        Album        = $album
+        AlbumSource  = $albumSource
+        Title        = $title
+        TitleSource  = $titleSource
+        Track        = $track
+        TrackSource  = $trackSource
+        Disc         = $disc
+        DiscSource   = $discSource
+        Date         = $date
+        DateSource   = $dateSource
+    }
+}
+
+function Invoke-ReviewReplacementCandidates {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceAnalysisPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $EvidenceAnalysisPath -PathType Leaf)) {
+        throw "Replacement evidence analysis not found: $EvidenceAnalysisPath`nRun -AnalyzeReplacementEvidence first."
+    }
+
+    $eligible = @(
+        Import-Csv -LiteralPath $EvidenceAnalysisPath |
+        Where-Object {
+            $_.EvidenceResolution -eq "UnreadableMediaSource" -and
+            $_.ReplacementConfidence -eq "High"
+        }
+    )
+
+    if ($eligible.Count -eq 0) {
+        Write-Host "No high-confidence UnreadableMediaSource items are available for candidate review."
+        return
+    }
+
+    $intakePath = Join-Path $OutputRoot "replacement-candidate-intake.csv"
+    $validationPath = Join-Path $OutputRoot "replacement-candidate-validation.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-candidate-summary.csv"
+
+    $existingBySource = @{}
+    if (Test-Path -LiteralPath $intakePath -PathType Leaf) {
+        foreach ($item in @(Import-Csv -LiteralPath $intakePath)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$item.SourcePath)) {
+                $existingBySource[[string]$item.SourcePath] = $item
+            }
+        }
+    }
+
+    $intake = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in $eligible) {
+        $existing = if ($existingBySource.ContainsKey([string]$row.SourcePath)) {
+            $existingBySource[[string]$row.SourcePath]
+        } else {
+            $null
+        }
+
+        $intake.Add([pscustomobject]@{
+            CandidateStatus = if ($existing -and $existing.CandidateStatus) { $existing.CandidateStatus } else { "AwaitingCandidate" }
+            SourcePath      = $row.SourcePath
+            AlbumDirectory = $row.AlbumDirectory
+            Artist         = $row.Artist
+            AlbumArtist    = $row.AlbumArtist
+            Album          = $row.Album
+            Date           = $row.Date
+            Disc           = $row.Disc
+            Track          = $row.Track
+            Title          = $row.Title
+            Extension      = $row.Extension
+            CandidatePath             = if ($existing) { $existing.CandidatePath } else { $null }
+            StageApproved             = if ($existing -and $existing.PSObject.Properties["StageApproved"]) { $existing.StageApproved } else { "No" }
+            ReplaceApproved           = if ($existing -and $existing.PSObject.Properties["ReplaceApproved"]) { $existing.ReplaceApproved } else { "No" }
+            QualityDowngradeApproved  = if ($existing -and $existing.PSObject.Properties["QualityDowngradeApproved"]) { $existing.QualityDowngradeApproved } else { "No" }
+            ReviewNotes               = if ($existing) { $existing.ReviewNotes } else { $null }
+        })
+    }
+
+    $validations = [System.Collections.Generic.List[object]]::new()
+    $withCandidate = @(
+        $intake | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_.CandidatePath)
+        }
+    )
+
+    foreach ($item in $withCandidate) {
+        $expectedIdentity = Get-ExpectedReplacementIdentity -Item $item
+        $candidatePath = [Environment]::ExpandEnvironmentVariables([string]$item.CandidatePath)
+        $candidatePath = $candidatePath.Trim()
+
+        $status = "CandidateNeedsIdentityReview"
+        $probeStatus = "NotRun"
+        $strictDecodeStatus = "NotRun"
+        $durationStatus = "NotRun"
+        $durationSeconds = $null
+        $candidateTitle = $null
+        $candidateArtist = $null
+        $candidateAlbum = $null
+        $candidateTrack = $null
+        $candidateDisc = $null
+        $titleMatch = $false
+        $artistMatch = $false
+        $albumMatch = $false
+        $trackMatch = $false
+        $discMatch = $false
+        $identityScore = 0
+        $identityMax = 0
+        $identityConflicts = [System.Collections.Generic.List[string]]::new()
+        $strictError = $null
+        $normalProbeError = $null
+        $forcedDemuxer = $null
+        $forcedProbeStatus = "NotRun"
+        $forcedDecodeStatus = "NotRun"
+        $usedForcedDemuxer = $false
+
+        if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+            $status = "CandidateMissing"
+        }
+        elseif ([string]::Equals(
+            (Resolve-Path -LiteralPath $candidatePath).Path,
+            (Resolve-Path -LiteralPath ([string]$item.SourcePath)).Path,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            $status = "CandidateIsSource"
+        }
+        else {
+            $candidateFile = Get-Item -LiteralPath $candidatePath
+            if ($AudioExtensions -notcontains $candidateFile.Extension.ToLowerInvariant()) {
+                $status = "CandidateUnsupportedFormat"
+            }
+            else {
+                $probe = Get-FFProbeInfo -File $candidateFile
+                if ($probe.ProbeError) {
+                    $probeStatus = "Failed"
+                    $normalProbeError = $probe.ProbeError
+                    $forcedDemuxer = Get-CandidateForcedDemuxer -File $candidateFile
+
+                    if ($forcedDemuxer) {
+                        $forcedProbe = Get-FFProbeInfoForced -File $candidateFile -Demuxer $forcedDemuxer
+                        if (-not $forcedProbe.ProbeError) {
+                            $forcedProbeStatus = "Pass"
+                            $probe = $forcedProbe
+                            $usedForcedDemuxer = $true
+
+                            $candidateTitle = $probe.Title
+                            $candidateArtist = $probe.Artist
+                            $candidateAlbum = $probe.Album
+                            $candidateTrack = $probe.Track
+                            $candidateDisc = $probe.Disc
+
+                            $forcedStrict = Test-CandidateAudioDecodeForced -File $candidateFile -Demuxer $forcedDemuxer
+                            if ($forcedStrict.Clean) {
+                                $forcedDecodeStatus = "Pass"
+                                $strictDecodeStatus = "PassForced"
+                                $durationSeconds = $probe.DurationSeconds
+
+                                if ($null -eq $durationSeconds -or [double]$durationSeconds -le 0) {
+                                    $durationStatus = "Unavailable"
+                                    $status = "CandidateForcedDemuxerDurationUnavailable"
+                                }
+                                else {
+                                    $durationStatus = "ReadableForced"
+                                    $status = "CandidateForcedDemuxerReview"
+                                }
+                            }
+                            else {
+                                $forcedDecodeStatus = "Failed"
+                                $strictDecodeStatus = "FailedForced"
+                                $status = "CandidateForcedDemuxerDecodeFailed"
+                                $strictError = $forcedStrict.ErrorText
+                            }
+                        }
+                        else {
+                            $forcedProbeStatus = "Failed"
+                            $status = "CandidateProbeFailed"
+                            $strictError = $forcedProbe.ProbeError
+                        }
+                    }
+                    else {
+                        $status = "CandidateProbeFailed"
+                        $strictError = $probe.ProbeError
+                    }
+                }
+                else {
+                    $probeStatus = "Pass"
+                    $candidateTitle = $probe.Title
+                    $candidateArtist = $probe.Artist
+                    $candidateAlbum = $probe.Album
+                    $candidateTrack = $probe.Track
+                    $candidateDisc = $probe.Disc
+
+                    $strict = Test-SourceAudioDecode -File $candidateFile
+                    if (-not $strict.Clean) {
+                        $strictDecodeStatus = "Failed"
+                        $status = "CandidateStrictDecodeFailed"
+                        $strictError = $strict.ErrorText
+                    }
+                    else {
+                        $strictDecodeStatus = "Pass"
+                        $durationSeconds = Get-ReportedAudioDurationSeconds -Path $candidateFile.FullName
+                        if ($null -eq $durationSeconds -or [double]$durationSeconds -le 0) {
+                            $durationStatus = "Unavailable"
+                            $status = "CandidateDurationUnavailable"
+                        }
+                        else {
+                            $durationStatus = "Readable"
+
+                            $expectedTitle = ConvertTo-IdentityKey ([string]$expectedIdentity.Title)
+                            $actualTitle = ConvertTo-IdentityKey ([string]$probe.Title)
+                            if ($expectedTitle) {
+                                $identityMax += 4
+                                if ($actualTitle -and $actualTitle -eq $expectedTitle) {
+                                    $identityScore += 4
+                                    $titleMatch = $true
+                                }
+                                elseif ($actualTitle) {
+                                    $identityConflicts.Add("Title")
+                                }
+                            }
+
+                            $expectedArtist = ConvertTo-IdentityKey ([string]$expectedIdentity.Artist)
+                            $actualArtist = ConvertTo-IdentityKey ([string]$probe.Artist)
+                            if ($expectedArtist) {
+                                $identityMax += 3
+                                if ($actualArtist -and $actualArtist -eq $expectedArtist) {
+                                    $identityScore += 3
+                                    $artistMatch = $true
+                                }
+                                elseif ($actualArtist) {
+                                    $identityConflicts.Add("Artist")
+                                }
+                            }
+
+                            $expectedAlbum = ConvertTo-IdentityKey ([string]$expectedIdentity.Album)
+                            $actualAlbum = ConvertTo-IdentityKey ([string]$probe.Album)
+                            if ($expectedAlbum) {
+                                $identityMax += 2
+                                if ($actualAlbum -and $actualAlbum -eq $expectedAlbum) {
+                                    $identityScore += 2
+                                    $albumMatch = $true
+                                }
+                                elseif ($actualAlbum) {
+                                    $identityConflicts.Add("Album")
+                                }
+                            }
+
+                            $expectedTrack = 0
+                            $actualTrack = 0
+                            if ([int]::TryParse([string]$expectedIdentity.Track, [ref]$expectedTrack)) {
+                                $identityMax += 1
+                                if ([int]::TryParse([string]$probe.Track, [ref]$actualTrack) -and $actualTrack -eq $expectedTrack) {
+                                    $identityScore += 1
+                                    $trackMatch = $true
+                                }
+                                elseif ($null -ne $probe.Track) {
+                                    $identityConflicts.Add("Track")
+                                }
+                            }
+
+                            $expectedDisc = 0
+                            $actualDisc = 0
+                            if ([int]::TryParse([string]$expectedIdentity.Disc, [ref]$expectedDisc)) {
+                                $identityMax += 1
+                                if ([int]::TryParse([string]$probe.Disc, [ref]$actualDisc) -and $actualDisc -eq $expectedDisc) {
+                                    $identityScore += 1
+                                    $discMatch = $true
+                                }
+                                elseif ($null -ne $probe.Disc) {
+                                    $identityConflicts.Add("Disc")
+                                }
+                            }
+
+                            $hardConflict = (
+                                $identityConflicts.Contains("Title") -or
+                                ($identityConflicts.Contains("Artist") -and -not $albumMatch)
+                            )
+
+                            if ($usedForcedDemuxer) {
+                                if ($hardConflict) {
+                                    $status = "CandidateForcedDemuxerIdentityConflict"
+                                }
+                                else {
+                                    $status = "CandidateForcedDemuxerReview"
+                                }
+                            }
+                            elseif ($hardConflict) {
+                                $status = "CandidateIdentityConflict"
+                            }
+                            elseif ($titleMatch -and ($artistMatch -or $albumMatch)) {
+                                $status = "CandidateValidatedForReview"
+                            }
+                            else {
+                                $status = "CandidateNeedsIdentityReview"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($usedForcedDemuxer -and $forcedDecodeStatus -eq "Pass" -and $durationStatus -eq "ReadableForced") {
+            $expectedTitle = ConvertTo-IdentityKey ([string]$expectedIdentity.Title)
+            $actualTitle = ConvertTo-IdentityKey ([string]$probe.Title)
+            if ($expectedTitle) {
+                $identityMax += 4
+                if ($actualTitle -and $actualTitle -eq $expectedTitle) {
+                    $identityScore += 4
+                    $titleMatch = $true
+                }
+                elseif ($actualTitle) {
+                    $identityConflicts.Add("Title")
+                }
+            }
+
+            $expectedArtist = ConvertTo-IdentityKey ([string]$expectedIdentity.Artist)
+            $actualArtist = ConvertTo-IdentityKey ([string]$probe.Artist)
+            if ($expectedArtist) {
+                $identityMax += 3
+                if ($actualArtist -and $actualArtist -eq $expectedArtist) {
+                    $identityScore += 3
+                    $artistMatch = $true
+                }
+                elseif ($actualArtist) {
+                    $identityConflicts.Add("Artist")
+                }
+            }
+
+            $expectedAlbum = ConvertTo-IdentityKey ([string]$expectedIdentity.Album)
+            $actualAlbum = ConvertTo-IdentityKey ([string]$probe.Album)
+            if ($expectedAlbum) {
+                $identityMax += 2
+                if ($actualAlbum -and $actualAlbum -eq $expectedAlbum) {
+                    $identityScore += 2
+                    $albumMatch = $true
+                }
+                elseif ($actualAlbum) {
+                    $identityConflicts.Add("Album")
+                }
+            }
+
+            $expectedTrack = 0
+            $actualTrack = 0
+            if ([int]::TryParse([string]$expectedIdentity.Track, [ref]$expectedTrack)) {
+                $identityMax += 1
+                if ([int]::TryParse([string]$probe.Track, [ref]$actualTrack) -and $actualTrack -eq $expectedTrack) {
+                    $identityScore += 1
+                    $trackMatch = $true
+                }
+                elseif ($null -ne $probe.Track) {
+                    $identityConflicts.Add("Track")
+                }
+            }
+
+            $expectedDisc = 0
+            $actualDisc = 0
+            if ([int]::TryParse([string]$expectedIdentity.Disc, [ref]$expectedDisc)) {
+                $identityMax += 1
+                if ([int]::TryParse([string]$probe.Disc, [ref]$actualDisc) -and $actualDisc -eq $expectedDisc) {
+                    $identityScore += 1
+                    $discMatch = $true
+                }
+                elseif ($null -ne $probe.Disc) {
+                    $identityConflicts.Add("Disc")
+                }
+            }
+
+            $hardConflict = (
+                $identityConflicts.Contains("Title") -or
+                ($identityConflicts.Contains("Artist") -and -not $albumMatch)
+            )
+
+            if ($hardConflict) {
+                $status = "CandidateForcedDemuxerIdentityConflict"
+            }
+            else {
+                $status = "CandidateForcedDemuxerReview"
+            }
+        }
+
+        $item.CandidateStatus = $status
+
+        $validations.Add([pscustomobject]@{
+            CandidateStatus          = $status
+            SourcePath               = $item.SourcePath
+            CandidatePath            = $candidatePath
+            CandidateExtension       = if (Test-Path -LiteralPath $candidatePath -PathType Leaf) { [IO.Path]::GetExtension($candidatePath).ToLowerInvariant() } else { $null }
+            ProbeStatus              = $probeStatus
+            NormalProbeError         = $normalProbeError
+            ForcedDemuxer            = $forcedDemuxer
+            ForcedProbeStatus        = $forcedProbeStatus
+            ForcedDecodeStatus       = $forcedDecodeStatus
+            StrictDecodeStatus       = $strictDecodeStatus
+            DurationStatus           = $durationStatus
+            CandidateDurationSeconds = $durationSeconds
+            IdentityScore            = $identityScore
+            IdentityMax              = $identityMax
+            IdentityConflicts        = ($identityConflicts -join ",")
+            IdentityBasis           = (@($expectedIdentity.ArtistSource,$expectedIdentity.AlbumSource,$expectedIdentity.TrackSource,$expectedIdentity.TitleSource,$expectedIdentity.DiscSource,$expectedIdentity.DateSource) | Where-Object { $_ } | Select-Object -Unique) -join ","
+            ExpectedArtist           = $expectedIdentity.Artist
+            ExpectedArtistSource     = $expectedIdentity.ArtistSource
+            CandidateArtist          = $candidateArtist
+            ArtistMatch              = $artistMatch
+            ExpectedAlbum            = $expectedIdentity.Album
+            ExpectedAlbumSource      = $expectedIdentity.AlbumSource
+            CandidateAlbum           = $candidateAlbum
+            AlbumMatch               = $albumMatch
+            ExpectedDisc             = $expectedIdentity.Disc
+            ExpectedDiscSource       = $expectedIdentity.DiscSource
+            CandidateDisc            = $candidateDisc
+            DiscMatch                = $discMatch
+            ExpectedTrack            = $expectedIdentity.Track
+            ExpectedTrackSource      = $expectedIdentity.TrackSource
+            CandidateTrack           = $candidateTrack
+            TrackMatch               = $trackMatch
+            ExpectedTitle            = $expectedIdentity.Title
+            ExpectedTitleSource      = $expectedIdentity.TitleSource
+            CandidateTitle           = $candidateTitle
+            TitleMatch               = $titleMatch
+            ExpectedDate             = $expectedIdentity.Date
+            ExpectedDateSource       = $expectedIdentity.DateSource
+            StrictError              = $strictError
+        })
+    }
+
+    $intake |
+        Sort-Object AlbumDirectory, Disc, Track, SourcePath |
+        Export-Csv -LiteralPath $intakePath -NoTypeInformation -Encoding UTF8
+
+    $validations |
+        Sort-Object CandidateStatus, SourcePath |
+        Export-Csv -LiteralPath $validationPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($intake | Group-Object CandidateStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "CandidateStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+    foreach ($group in ($validations | Group-Object StrictDecodeStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "StrictDecodeStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT CANDIDATE REVIEW"
+    Write-Host ("=" * 72)
+    Write-Host "Eligible sources : $($eligible.Count)"
+    Write-Host "Candidate paths  : $($withCandidate.Count)"
+
+    Write-Host ""
+    Write-Host "Candidate status:"
+    foreach ($group in ($intake | Group-Object CandidateStatus | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-34} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Files:"
+    Write-Host "  Intake     : $intakePath"
+    Write-Host "  Validation : $validationPath"
+    Write-Host "  Summary    : $summaryPath"
+
+    if ($withCandidate.Count -eq 0) {
+        Write-Host ""
+        Write-Host "No candidate paths are assigned yet."
+        Write-Host "Add a local file path to CandidatePath in replacement-candidate-intake.csv, then rerun this mode."
+    }
+
+    Write-Host ""
+    Write-Host "Candidate files were read for validation only."
+    Write-Host "No source media files were modified."
+    Write-Host "No candidate media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "CandidateValidatedForReview means structurally clean and identity-plausible; it does NOT authorize staging or replacement.`nCandidateForcedDemuxerReview means normal probing failed but an extension-specific forced demuxer passed probe/decode; it always requires review."
+}
+
+
+function Test-TruthyStageApproval {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return @("1","true","yes","y","stage","approved") -contains $Value.Trim().ToLowerInvariant()
+}
+
+function Get-StagingSourceKey {
+    param([Parameter(Mandatory)][string]$SourcePath)
+
+    $bytes = [Text.Encoding]::UTF8.GetBytes($SourcePath.ToLowerInvariant())
+    $hash = [Security.Cryptography.SHA256]::HashData($bytes)
+    return ([Convert]::ToHexString($hash)).Substring(0,16).ToLowerInvariant()
+}
+
+function Invoke-StageReplacementCandidates {
+    param(
+        [Parameter(Mandatory)][string]$CandidateIntakePath,
+        [Parameter(Mandatory)][string]$CandidateValidationPath,
+        [Parameter(Mandatory)][string]$StagingRoot,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $CandidateIntakePath -PathType Leaf)) {
+        throw "Candidate intake not found: $CandidateIntakePath`nRun -ReviewReplacementCandidates first."
+    }
+    if (-not (Test-Path -LiteralPath $CandidateValidationPath -PathType Leaf)) {
+        throw "Candidate validation not found: $CandidateValidationPath`nRun -ReviewReplacementCandidates first."
+    }
+
+    $intake = @(Import-Csv -LiteralPath $CandidateIntakePath)
+    $validations = @(Import-Csv -LiteralPath $CandidateValidationPath)
+
+    $validationBySource = @{}
+    foreach ($v in $validations) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$v.SourcePath)) {
+            $validationBySource[[string]$v.SourcePath] = $v
+        }
+    }
+
+    $approved = @(
+        $intake | Where-Object {
+            Test-TruthyStageApproval ([string]$_.StageApproved)
+        }
+    )
+
+    $manifestPath = Join-Path $OutputRoot "replacement-staging-manifest.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-staging-summary.csv"
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    if (-not (Test-Path -LiteralPath $StagingRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $StagingRoot -Force | Out-Null
+    }
+
+    foreach ($item in $approved) {
+        $sourcePath = [string]$item.SourcePath
+        $candidatePath = [Environment]::ExpandEnvironmentVariables([string]$item.CandidatePath)
+        $candidatePath = $candidatePath.Trim()
+
+        $status = "NotStaged"
+        $reason = $null
+        $validationStatus = $null
+        $candidateHash = $null
+        $stagedHash = $null
+        $stagedPath = $null
+        $copyVerified = $false
+        $stagedDecodeStatus = "NotRun"
+        $forcedDemuxer = $null
+
+        if (-not $validationBySource.ContainsKey($sourcePath)) {
+            $status = "Blocked"
+            $reason = "NoCandidateValidation"
+        }
+        else {
+            $validation = $validationBySource[$sourcePath]
+            $validationStatus = [string]$validation.CandidateStatus
+            $forcedDemuxer = [string]$validation.ForcedDemuxer
+
+            if ($validationStatus -notin @("CandidateValidatedForReview","CandidateForcedDemuxerReview")) {
+                $status = "Blocked"
+                $reason = "CandidateStatusNotStageEligible"
+            }
+            elseif ([string]::IsNullOrWhiteSpace($candidatePath) -or -not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                $status = "Blocked"
+                $reason = "CandidateMissing"
+            }
+            else {
+                $candidateFile = Get-Item -LiteralPath $candidatePath
+                $sourceKey = Get-StagingSourceKey -SourcePath $sourcePath
+                $stageDir = Join-Path $StagingRoot $sourceKey
+                if (-not (Test-Path -LiteralPath $stageDir -PathType Container)) {
+                    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+                }
+
+                $stagedPath = Join-Path $stageDir $candidateFile.Name
+                $tempPath = "$stagedPath.partial"
+
+                if (Test-Path -LiteralPath $tempPath) {
+                    Remove-Item -LiteralPath $tempPath -Force
+                }
+
+                $candidateHash = (Get-FileHash -LiteralPath $candidateFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+                Copy-Item -LiteralPath $candidateFile.FullName -Destination $tempPath -Force
+
+                $tempHash = (Get-FileHash -LiteralPath $tempPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($candidateHash -ne $tempHash) {
+                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                    $status = "Blocked"
+                    $reason = "StageCopyHashMismatch"
+                }
+                else {
+                    Move-Item -LiteralPath $tempPath -Destination $stagedPath -Force
+                    $stagedHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                    $copyVerified = ($candidateHash -eq $stagedHash)
+
+                    if (-not $copyVerified) {
+                        $status = "Blocked"
+                        $reason = "FinalStageHashMismatch"
+                    }
+                    else {
+                        $stagedFile = Get-Item -LiteralPath $stagedPath
+                        if ($validationStatus -eq "CandidateForcedDemuxerReview") {
+                            if ([string]::IsNullOrWhiteSpace($forcedDemuxer)) {
+                                $status = "Blocked"
+                                $reason = "ForcedDemuxerMissingFromValidation"
+                            }
+                            else {
+                                $decode = Test-CandidateAudioDecodeForced -File $stagedFile -Demuxer $forcedDemuxer
+                                if ($decode.Clean) {
+                                    $stagedDecodeStatus = "PassForced"
+                                    $status = "StagedVerified"
+                                }
+                                else {
+                                    $stagedDecodeStatus = "FailedForced"
+                                    $status = "Blocked"
+                                    $reason = "StagedStrictDecodeFailed"
+                                }
+                            }
+                        }
+                        else {
+                            $decode = Test-SourceAudioDecode -File $stagedFile
+                            if ($decode.Clean) {
+                                $stagedDecodeStatus = "Pass"
+                                $status = "StagedVerified"
+                            }
+                            else {
+                                $stagedDecodeStatus = "Failed"
+                                $status = "Blocked"
+                                $reason = "StagedStrictDecodeFailed"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        $rows.Add([pscustomobject]@{
+            StageStatus         = $status
+            BlockReason         = $reason
+            SourcePath          = $sourcePath
+            CandidatePath       = $candidatePath
+            CandidateStatus     = $validationStatus
+            ForcedDemuxer       = $forcedDemuxer
+            StagedPath          = $stagedPath
+            CandidateSHA256     = $candidateHash
+            StagedSHA256        = $stagedHash
+            CopyHashVerified    = $copyVerified
+            StagedDecodeStatus  = $stagedDecodeStatus
+            StagedAt            = (Get-Date).ToString("o")
+        })
+    }
+
+    $rows |
+        Sort-Object StageStatus, SourcePath |
+        Export-Csv -LiteralPath $manifestPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($rows | Group-Object StageStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "StageStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+    foreach ($group in ($rows | Group-Object BlockReason | Where-Object { $_.Name } | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "BlockReason"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT CANDIDATE STAGING"
+    Write-Host ("=" * 72)
+    Write-Host "Approved for staging : $($approved.Count)"
+
+    Write-Host ""
+    Write-Host "Stage status:"
+    if ($rows.Count -eq 0) {
+        Write-Host "  Nothing approved for staging."
+    }
+    else {
+        foreach ($group in ($rows | Group-Object StageStatus | Sort-Object Count -Descending)) {
+            Write-Host ("  {0,-28} {1,6}" -f $group.Name,$group.Count)
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Files:"
+    Write-Host "  Manifest : $manifestPath"
+    Write-Host "  Summary  : $summaryPath"
+    Write-Host "  Staging  : $StagingRoot"
+
+    if ($approved.Count -eq 0) {
+        Write-Host ""
+        Write-Host "Set StageApproved to Yes for a reviewed candidate in replacement-candidate-intake.csv, then rerun."
+    }
+
+    Write-Host ""
+    Write-Host "Staging copies candidate media only into the repair workspace."
+    Write-Host "Original library media was NOT modified."
+    Write-Host "Candidate source files were NOT modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "StagedVerified means the copy hash matches and the staged copy passed strict decode; it does NOT authorize replacement."
+}
+
+
+
+function Get-MediaQualityClassFromExtension {
+    param([AllowNull()][string]$PathOrExtension)
+
+    if ([string]::IsNullOrWhiteSpace($PathOrExtension)) {
+        return "Unknown"
+    }
+
+    $ext = $PathOrExtension
+    if (-not $ext.StartsWith(".")) {
+        $ext = [IO.Path]::GetExtension($PathOrExtension)
+    }
+    $ext = $ext.ToLowerInvariant()
+
+    # Keep this deliberately conservative. Ambiguous containers stay Unknown.
+    switch ($ext) {
+        ".flac" { return "Lossless" }
+        ".wav"  { return "Lossless" }
+        ".aiff" { return "Lossless" }
+        ".aif"  { return "Lossless" }
+        ".ape"  { return "Lossless" }
+
+        ".mp3"  { return "Lossy" }
+        ".aac"  { return "Lossy" }
+        ".opus" { return "Lossy" }
+
+        default { return "Unknown" }
+    }
+}
+
+function Get-ReplacementQualityRelationship {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$ReplacementPath
+    )
+
+    $sourceClass = Get-MediaQualityClassFromExtension -PathOrExtension $SourcePath
+    $replacementClass = Get-MediaQualityClassFromExtension -PathOrExtension $ReplacementPath
+
+    $relationship =
+        if ($sourceClass -eq "Lossless" -and $replacementClass -eq "Lossy") {
+            "QualityDowngrade"
+        }
+        elseif ($sourceClass -eq "Lossy" -and $replacementClass -eq "Lossless") {
+            # This only describes the media class of the supplied candidate.
+            # It does not prove that the candidate originated from a true lossless master.
+            "LosslessClassCandidate"
+        }
+        elseif ($sourceClass -eq $replacementClass -and $sourceClass -ne "Unknown") {
+            "SameQualityClass"
+        }
+        else {
+            "Unknown"
+        }
+
+    [pscustomobject]@{
+        SourceClass      = $sourceClass
+        ReplacementClass = $replacementClass
+        Relationship     = $relationship
+    }
+}
+
+function Get-ReplacementTargetPath {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$StagedPath
+    )
+
+    $sourceExt = [IO.Path]::GetExtension($SourcePath)
+    $stagedExt = [IO.Path]::GetExtension($StagedPath)
+
+    if ([string]::IsNullOrWhiteSpace($stagedExt)) {
+        throw "Staged replacement has no file extension: $StagedPath"
+    }
+
+    if ([string]::Equals($sourceExt, $stagedExt, [StringComparison]::OrdinalIgnoreCase)) {
+        return $SourcePath
+    }
+
+    return [IO.Path]::ChangeExtension($SourcePath, $stagedExt)
+}
+
+function Test-ReplacementMediaDecode {
+    param(
+        [Parameter(Mandatory)][System.IO.FileInfo]$File,
+        [AllowNull()][string]$ForcedDemuxer
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ForcedDemuxer)) {
+        return Test-CandidateAudioDecodeForced -File $File -Demuxer $ForcedDemuxer
+    }
+
+    return Test-SourceAudioDecode -File $File
+}
+
+function Invoke-ApplyStagedReplacements {
+    param(
+        [Parameter(Mandatory)][string]$CandidateIntakePath,
+        [Parameter(Mandatory)][string]$StagingManifestPath,
+        [Parameter(Mandatory)][string]$BackupRoot,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not $BackupOriginals) {
+        throw "-ApplyStagedReplacements requires -BackupOriginals."
+    }
+    if (-not $Yes) {
+        throw "-ApplyStagedReplacements requires -Yes. This mode modifies the music library."
+    }
+    if (-not (Test-Path -LiteralPath $CandidateIntakePath -PathType Leaf)) {
+        throw "Candidate intake not found: $CandidateIntakePath"
+    }
+    if (-not (Test-Path -LiteralPath $StagingManifestPath -PathType Leaf)) {
+        throw "Staging manifest not found: $StagingManifestPath`nRun -StageReplacementCandidates first."
+    }
+
+    $intake = @(Import-Csv -LiteralPath $CandidateIntakePath)
+    $staging = @(Import-Csv -LiteralPath $StagingManifestPath)
+
+    $stagingBySource = @{}
+    foreach ($row in $staging) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$row.SourcePath)) {
+            $stagingBySource[[string]$row.SourcePath] = $row
+        }
+    }
+
+    $approved = @(
+        $intake | Where-Object {
+            Test-TruthyStageApproval ([string]$_.ReplaceApproved)
+        }
+    )
+
+    $transactionPath = Join-Path $OutputRoot "replacement-transaction-manifest.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-transaction-summary.csv"
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    }
+
+    foreach ($item in $approved) {
+        $sourcePath = [string]$item.SourcePath
+        $status = "Blocked"
+        $reason = $null
+        $stagedPath = $null
+        $targetPath = $null
+        $backupPath = $null
+        $sourceHash = $null
+        $backupHash = $null
+        $stagedHashExpected = $null
+        $stagedHashObserved = $null
+        $targetHash = $null
+        $backupVerified = $false
+        $stagedVerified = $false
+        $targetDecodeStatus = "NotRun"
+        $rollbackPerformed = $false
+        $forcedDemuxer = $null
+        $sourceRemoved = $false
+        $swapBackupPath = $null
+        $sourceQualityClass = $null
+        $replacementQualityClass = $null
+        $qualityRelationship = $null
+        $qualityDowngradeApproved = $false
+
+        try {
+            if (-not $stagingBySource.ContainsKey($sourcePath)) {
+                $reason = "NoStagingManifest"
+                continue
+            }
+
+            $stage = $stagingBySource[$sourcePath]
+            if ([string]$stage.StageStatus -ne "StagedVerified") {
+                $reason = "StageStatusNotVerified"
+                continue
+            }
+
+            $stagedPath = [string]$stage.StagedPath
+            $stagedHashExpected = ([string]$stage.StagedSHA256).ToLowerInvariant()
+            $forcedDemuxer = [string]$stage.ForcedDemuxer
+
+            if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                $reason = "SourceMissing"
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($stagedPath) -or -not (Test-Path -LiteralPath $stagedPath -PathType Leaf)) {
+                $reason = "StagedFileMissing"
+                continue
+            }
+
+            $stagedHashObserved = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($stagedHashExpected) -or $stagedHashObserved -ne $stagedHashExpected) {
+                $reason = "StagedHashChanged"
+                continue
+            }
+            $stagedVerified = $true
+
+            $targetPath = Get-ReplacementTargetPath -SourcePath $sourcePath -StagedPath $stagedPath
+
+            $quality = Get-ReplacementQualityRelationship -SourcePath $sourcePath -ReplacementPath $targetPath
+            $sourceQualityClass = $quality.SourceClass
+            $replacementQualityClass = $quality.ReplacementClass
+            $qualityRelationship = $quality.Relationship
+            $qualityDowngradeApproved = Test-TruthyStageApproval ([string]$item.QualityDowngradeApproved)
+
+            if ($qualityRelationship -eq "QualityDowngrade" -and -not $qualityDowngradeApproved) {
+                $reason = "QualityDowngradeRequiresExplicitApproval"
+                continue
+            }
+
+            if (-not [string]::Equals($targetPath, $sourcePath, [StringComparison]::OrdinalIgnoreCase) -and
+                (Test-Path -LiteralPath $targetPath)) {
+                $reason = "ReplacementTargetAlreadyExists"
+                continue
+            }
+
+            $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+            $sourceKey = Get-StagingSourceKey -SourcePath $sourcePath
+            $stamp = (Get-Date).ToString("yyyyMMdd-HHmmssfff")
+            $backupDir = Join-Path (Join-Path $BackupRoot $sourceKey) $stamp
+            New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+            $backupPath = Join-Path $backupDir ([IO.Path]::GetFileName($sourcePath))
+
+            Copy-Item -LiteralPath $sourcePath -Destination $backupPath -Force
+            $backupHash = (Get-FileHash -LiteralPath $backupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($backupHash -ne $sourceHash) {
+                $reason = "BackupHashMismatch"
+                continue
+            }
+            $backupVerified = $true
+
+            $targetDir = Split-Path -Parent $targetPath
+            $targetExt = [IO.Path]::GetExtension($targetPath)
+            $targetStem = [IO.Path]::GetFileNameWithoutExtension($targetPath)
+            $tempName = ".{0}.replacement-{1}{2}" -f $targetStem,([guid]::NewGuid().ToString("N")),$targetExt
+            $tempPath = Join-Path $targetDir $tempName
+
+            try {
+                Copy-Item -LiteralPath $stagedPath -Destination $tempPath -Force
+
+                $tempHash = (Get-FileHash -LiteralPath $tempPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($tempHash -ne $stagedHashObserved) {
+                    throw "Temporary replacement copy hash mismatch."
+                }
+
+                $tempFile = Get-Item -LiteralPath $tempPath
+                $tempDecode = Test-ReplacementMediaDecode -File $tempFile -ForcedDemuxer $forcedDemuxer
+                if (-not $tempDecode.Clean) {
+                    throw "Temporary replacement strict decode failed: $($tempDecode.ErrorText)"
+                }
+
+                if ([string]::Equals($targetPath, $sourcePath, [StringComparison]::OrdinalIgnoreCase)) {
+                    # Same-extension replacement. File.Replace on Windows requires a
+                    # non-empty backup path on the runtime used by the RC environment.
+                    # We already retain our authoritative verified backup separately, so
+                    # this same-directory swap backup exists only to satisfy the atomic
+                    # replace operation and is removed after the transaction verifies.
+                    $swapBackupPath = Join-Path $targetDir (
+                        ".{0}.swap-backup-{1}{2}" -f
+                            $targetStem,
+                            ([guid]::NewGuid().ToString("N")),
+                            $targetExt
+                    )
+
+                    [IO.File]::Replace($tempPath, $sourcePath, $swapBackupPath, $true)
+                }
+                else {
+                    # Cross-extension replacement. First publish the verified replacement
+                    # under its correct extension while leaving the original source intact.
+                    Move-Item -LiteralPath $tempPath -Destination $targetPath
+
+                    $publishedHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($publishedHash -ne $stagedHashObserved) {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                        throw "Published replacement hash mismatch."
+                    }
+
+                    $publishedFile = Get-Item -LiteralPath $targetPath
+                    $publishedDecode = Test-ReplacementMediaDecode -File $publishedFile -ForcedDemuxer $forcedDemuxer
+                    if (-not $publishedDecode.Clean) {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                        throw "Published replacement strict decode failed: $($publishedDecode.ErrorText)"
+                    }
+
+                    # Remove the damaged source only after the replacement is fully verified.
+                    try {
+                        Remove-Item -LiteralPath $sourcePath -Force
+                        $sourceRemoved = $true
+                    }
+                    catch {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                        throw "Could not remove original source after publishing replacement: $($_.Exception.Message)"
+                    }
+                }
+
+                if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
+                    throw "Replacement target is missing after commit."
+                }
+
+                $targetHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($targetHash -ne $stagedHashObserved) {
+                    throw "Committed replacement hash mismatch."
+                }
+
+                $targetFile = Get-Item -LiteralPath $targetPath
+                $targetDecode = Test-ReplacementMediaDecode -File $targetFile -ForcedDemuxer $forcedDemuxer
+                if (-not $targetDecode.Clean) {
+                    throw "Committed replacement strict decode failed: $($targetDecode.ErrorText)"
+                }
+
+                $targetDecodeStatus = if ($forcedDemuxer) { "PassForced" } else { "Pass" }
+                $status = "ReplacementCommitted"
+                $reason = $null
+            }
+            catch {
+                $reason = $_.Exception.Message
+                $targetDecodeStatus = "Failed"
+
+                # Best-effort rollback. The verified backup is the authority.
+                try {
+                    if (-not [string]::IsNullOrWhiteSpace($targetPath) -and
+                        (Test-Path -LiteralPath $targetPath -PathType Leaf) -and
+                        -not [string]::Equals($targetPath, $sourcePath, [StringComparison]::OrdinalIgnoreCase)) {
+                        Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+                    }
+
+                    if ($backupVerified) {
+                        Copy-Item -LiteralPath $backupPath -Destination $sourcePath -Force
+                        $restoredHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                        if ($restoredHash -eq $sourceHash) {
+                            $rollbackPerformed = $true
+                            $status = "RolledBack"
+                        }
+                        else {
+                            $status = "RollbackFailed"
+                            $reason = "$reason | restored source hash mismatch"
+                        }
+                    }
+                }
+                catch {
+                    $status = "RollbackFailed"
+                    $reason = "$reason | rollback error: $($_.Exception.Message)"
+                }
+            }
+            finally {
+                if (Test-Path -LiteralPath $tempPath) {
+                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                }
+                if (-not [string]::IsNullOrWhiteSpace($swapBackupPath) -and
+                    (Test-Path -LiteralPath $swapBackupPath -PathType Leaf)) {
+                    Remove-Item -LiteralPath $swapBackupPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        finally {
+            $rows.Add([pscustomobject]@{
+                TransactionStatus   = $status
+                BlockReason         = $reason
+                SourcePath          = $sourcePath
+                StagedPath          = $stagedPath
+                ReplacementPath     = $targetPath
+                BackupPath          = $backupPath
+                ForcedDemuxer       = $forcedDemuxer
+                SourceQualityClass  = $sourceQualityClass
+                ReplacementQualityClass = $replacementQualityClass
+                QualityRelationship = $qualityRelationship
+                QualityDowngradeApproved = $qualityDowngradeApproved
+                SourceSHA256        = $sourceHash
+                BackupSHA256        = $backupHash
+                StagedSHA256Expected= $stagedHashExpected
+                StagedSHA256Observed= $stagedHashObserved
+                ReplacementSHA256   = $targetHash
+                BackupVerified      = $backupVerified
+                StagedVerified      = $stagedVerified
+                ReplacementDecode   = $targetDecodeStatus
+                RollbackPerformed   = $rollbackPerformed
+                SourceRemoved       = $sourceRemoved
+                TransactionAt       = (Get-Date).ToString("o")
+            })
+        }
+    }
+
+    $rows |
+        Sort-Object TransactionStatus, SourcePath |
+        Export-Csv -LiteralPath $transactionPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($rows | Group-Object TransactionStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "TransactionStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " STAGED REPLACEMENT TRANSACTIONS"
+    Write-Host ("=" * 72)
+    Write-Host "Approved for replacement : $($approved.Count)"
+
+    Write-Host ""
+    Write-Host "Transaction status:"
+    if ($rows.Count -eq 0) {
+        Write-Host "  Nothing approved for replacement."
+    }
+    else {
+        foreach ($group in ($rows | Group-Object TransactionStatus | Sort-Object Count -Descending)) {
+            Write-Host ("  {0,-28} {1,6}" -f $group.Name,$group.Count)
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Files:"
+    Write-Host "  Manifest : $transactionPath"
+    Write-Host "  Summary  : $summaryPath"
+    Write-Host "  Backups  : $BackupRoot"
+
+    if ($approved.Count -eq 0) {
+        Write-Host ""
+        Write-Host "Set ReplaceApproved to Yes for a reviewed, StagedVerified candidate, then rerun."
+    }
+
+    Write-Host ""
+    Write-Host "Replacement requires explicit ReplaceApproved=Yes, -BackupOriginals, and -Yes."
+    Write-Host "Known lossless-to-lossy replacement also requires QualityDowngradeApproved=Yes."
+    Write-Host "Ambiguous media classes are reported as Unknown rather than guessed."
+    Write-Host "Every source is backed up and hash-verified before commit."
+    Write-Host "The replacement is hash-verified and strict-decoded before the transaction is accepted."
+    Write-Host "Failures trigger best-effort rollback from the verified backup."
+    Write-Host "Backups are retained after successful replacement for manual recovery."
+
+    $committedCount = @($rows | Where-Object { $_.TransactionStatus -eq "ReplacementCommitted" }).Count
+    if ($committedCount -gt 0) {
+        Invoke-VerifyReplacementTransactions `
+            -TransactionManifestPath $transactionPath `
+            -OutputRoot $OutputRoot
+    }
+}
+
+
+function Get-CurrentAlbumQualification {
+    param(
+        [Parameter(Mandatory)][string]$AlbumDirectory,
+        [AllowNull()][string]$KnownReplacementPath,
+        [AllowNull()][string]$KnownForcedDemuxer
+    )
+
+    if (-not (Test-Path -LiteralPath $AlbumDirectory -PathType Container)) {
+        return [pscustomobject]@{
+            Status               = "MISSING ALBUM"
+            Tracks               = 0
+            ProbeErrors          = 0
+            SourceDecodeErrors   = 0
+            MissingTitle         = 0
+            MissingArtist        = 0
+            MissingAlbum         = 0
+            MissingTrack         = 0
+            MissingAlbumArtist   = 0
+            MissingEmbeddedCover = 0
+            ArtworkFiles         = 0
+            SuspiciousTitles     = 0
+            MetadataWarnings     = "Album directory is missing"
+        }
+    }
+
+    $files = @(
+        Get-ChildItem -LiteralPath $AlbumDirectory -File -ErrorAction Stop |
+        Where-Object { $_.Extension.ToLowerInvariant() -in $AudioExtensions } |
+        Sort-Object Name
+    )
+
+    $tracks = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($file in $files) {
+        $useForced = (
+            -not [string]::IsNullOrWhiteSpace($KnownReplacementPath) -and
+            -not [string]::IsNullOrWhiteSpace($KnownForcedDemuxer) -and
+            [string]::Equals($file.FullName, $KnownReplacementPath, [StringComparison]::OrdinalIgnoreCase)
+        )
+
+        $probe = if ($useForced) {
+            Get-FFProbeInfoForced -File $file -Demuxer $KnownForcedDemuxer
+        }
+        else {
+            Get-FFProbeInfo -File $file
+        }
+
+        $decode = if ($useForced) {
+            Test-CandidateAudioDecodeForced -File $file -Demuxer $KnownForcedDemuxer
+        }
+        else {
+            Test-SourceAudioDecode -File $file
+        }
+
+        $tracks.Add([pscustomobject]@{
+            Path          = $file.FullName
+            FileName      = $file.Name
+            Title         = $probe.Title
+            Artist        = $probe.Artist
+            AlbumArtist   = $probe.AlbumArtist
+            Album         = $probe.Album
+            Track         = $probe.Track
+            Disc          = $probe.Disc
+            Date          = $probe.Date
+            Genre         = $probe.Genre
+            EmbeddedCover = [bool]$probe.EmbeddedCover
+            ProbeError    = $probe.ProbeError
+            DecodeClean   = [bool]$decode.Clean
+            DecodeError   = $decode.ErrorText
+            ForcedDemuxer = if ($useForced) { $KnownForcedDemuxer } else { $null }
+        })
+    }
+
+    $missingTitle = @($tracks | Where-Object { -not $_.Title }).Count
+    $missingArtist = @($tracks | Where-Object { -not $_.Artist }).Count
+    $missingAlbum = @($tracks | Where-Object { -not $_.Album }).Count
+    $missingTrack = @($tracks | Where-Object { $null -eq $_.Track }).Count
+    $missingAlbumArtist = @($tracks | Where-Object { -not $_.AlbumArtist }).Count
+    $missingEmbedded = @($tracks | Where-Object { -not $_.EmbeddedCover }).Count
+    $probeErrors = @($tracks | Where-Object { $_.ProbeError }).Count
+    $sourceDecodeErrors = @($tracks | Where-Object { -not $_.DecodeClean }).Count
+    $suspiciousTitles = @($tracks | Where-Object { Test-SuspiciousTitle ([string]$_.Title) }).Count
+
+    $artCount = @(
+        Get-ChildItem -LiteralPath $AlbumDirectory -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension.ToLowerInvariant() -in $ArtworkExtensions }
+    ).Count
+    $preferredArt = Get-PreferredArtwork $AlbumDirectory
+
+    $metadataWarnings = [System.Collections.Generic.List[string]]::new()
+    if ($missingTitle -gt 0)       { $metadataWarnings.Add("$missingTitle track(s) missing title") }
+    if ($missingArtist -gt 0)      { $metadataWarnings.Add("$missingArtist track(s) missing artist") }
+    if ($missingAlbum -gt 0)       { $metadataWarnings.Add("$missingAlbum track(s) missing album") }
+    if ($missingTrack -gt 0)       { $metadataWarnings.Add("$missingTrack track(s) missing track number") }
+    if ($missingAlbumArtist -gt 0) { $metadataWarnings.Add("$missingAlbumArtist track(s) missing album artist") }
+    if ($probeErrors -gt 0)        { $metadataWarnings.Add("$probeErrors ffprobe error(s)") }
+    if ($sourceDecodeErrors -gt 0) { $metadataWarnings.Add("$sourceDecodeErrors SOURCE DECODE ERROR track(s)") }
+    if ($suspiciousTitles -gt 0)   { $metadataWarnings.Add("$suspiciousTitles possible ID3v1-truncated title(s)") }
+
+    $status = "READY"
+    if ($sourceDecodeErrors -gt 0) {
+        $status = "SOURCE ERROR"
+    }
+    elseif ($probeErrors -gt 0 -or $missingTitle -gt 0 -or $missingArtist -gt 0 -or $missingAlbum -gt 0 -or $missingTrack -gt 0) {
+        $status = "INCOMPLETE"
+    }
+    elseif ($metadataWarnings.Count -gt 0 -or $missingEmbedded -gt 0 -or -not $preferredArt) {
+        $status = "NEEDS REVIEW"
+    }
+
+    [pscustomobject]@{
+        Status               = $status
+        Tracks               = $tracks.Count
+        ProbeErrors          = $probeErrors
+        SourceDecodeErrors   = $sourceDecodeErrors
+        MissingTitle         = $missingTitle
+        MissingArtist        = $missingArtist
+        MissingAlbum         = $missingAlbum
+        MissingTrack         = $missingTrack
+        MissingAlbumArtist   = $missingAlbumArtist
+        MissingEmbeddedCover = $missingEmbedded
+        ArtworkFiles         = $artCount
+        SuspiciousTitles     = $suspiciousTitles
+        MetadataWarnings     = ($metadataWarnings -join "; ")
+    }
+}
+
+function Invoke-VerifyReplacementTransactions {
+    param(
+        [Parameter(Mandatory)][string]$TransactionManifestPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $TransactionManifestPath -PathType Leaf)) {
+        throw "Replacement transaction manifest not found: $TransactionManifestPath"
+    }
+
+    $transactions = @(
+        Import-Csv -LiteralPath $TransactionManifestPath |
+        Where-Object { $_.TransactionStatus -eq "ReplacementCommitted" }
+    )
+
+    $reportPath = Join-Path $OutputRoot "replacement-postverify.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-postverify-summary.csv"
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($tx in $transactions) {
+        $sourcePath = [string]$tx.SourcePath
+        $replacementPath = [string]$tx.ReplacementPath
+        $backupPath = [string]$tx.BackupPath
+        $forcedDemuxer = [string]$tx.ForcedDemuxer
+
+        $sourcePresent = Test-Path -LiteralPath $sourcePath -PathType Leaf
+        $replacementPresent = Test-Path -LiteralPath $replacementPath -PathType Leaf
+        $backupPresent = Test-Path -LiteralPath $backupPath -PathType Leaf
+
+        $replacementHashMatches = $false
+        $backupHashMatches = $false
+        $replacementDecode = "NotRun"
+        $replacementDecodeError = $null
+
+        if ($replacementPresent) {
+            $observedReplacementHash = (Get-FileHash -LiteralPath $replacementPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expectedReplacementHash = ([string]$tx.ReplacementSHA256).ToLowerInvariant()
+            $replacementHashMatches = (
+                -not [string]::IsNullOrWhiteSpace($expectedReplacementHash) -and
+                $observedReplacementHash -eq $expectedReplacementHash
+            )
+
+            $replacementFile = Get-Item -LiteralPath $replacementPath
+            $decode = Test-ReplacementMediaDecode -File $replacementFile -ForcedDemuxer $forcedDemuxer
+            if ($decode.Clean) {
+                $replacementDecode = if ($forcedDemuxer) { "PassForced" } else { "Pass" }
+            }
+            else {
+                $replacementDecode = "Failed"
+                $replacementDecodeError = $decode.ErrorText
+            }
+        }
+
+        if ($backupPresent) {
+            $observedBackupHash = (Get-FileHash -LiteralPath $backupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expectedSourceHash = ([string]$tx.SourceSHA256).ToLowerInvariant()
+            $backupHashMatches = (
+                -not [string]::IsNullOrWhiteSpace($expectedSourceHash) -and
+                $observedBackupHash -eq $expectedSourceHash
+            )
+        }
+
+        $samePath = [string]::Equals($sourcePath, $replacementPath, [StringComparison]::OrdinalIgnoreCase)
+        $sourceDispositionOk = if ($samePath) { $replacementPresent } else { -not $sourcePresent }
+
+        $albumDirectory = Split-Path -Parent $replacementPath
+        $album = Get-CurrentAlbumQualification `
+            -AlbumDirectory $albumDirectory `
+            -KnownReplacementPath $replacementPath `
+            -KnownForcedDemuxer $forcedDemuxer
+
+        $queueStatus = if (
+            $sourceDispositionOk -and
+            $replacementPresent -and
+            $replacementHashMatches -and
+            $replacementDecode -in @("Pass","PassForced")
+        ) {
+            "ClearedByCurrentState"
+        }
+        else {
+            "StillRequiresAttention"
+        }
+
+        $verificationStatus = if (
+            $queueStatus -eq "ClearedByCurrentState" -and
+            $backupPresent -and
+            $backupHashMatches -and
+            $album.SourceDecodeErrors -eq 0
+        ) {
+            "Verified"
+        }
+        else {
+            "NeedsAttention"
+        }
+
+        $rows.Add([pscustomobject]@{
+            VerificationStatus      = $verificationStatus
+            QueueStatus             = $queueStatus
+            SourcePath              = $sourcePath
+            SourceStillPresent      = $sourcePresent
+            ReplacementPath         = $replacementPath
+            ReplacementPresent      = $replacementPresent
+            ReplacementHashMatches  = $replacementHashMatches
+            ReplacementDecode       = $replacementDecode
+            ReplacementDecodeError  = $replacementDecodeError
+            BackupPath              = $backupPath
+            BackupPresent           = $backupPresent
+            BackupHashMatches       = $backupHashMatches
+            AlbumDirectory          = $albumDirectory
+            AlbumStatus             = $album.Status
+            AlbumTracks             = $album.Tracks
+            AlbumProbeErrors        = $album.ProbeErrors
+            AlbumSourceDecodeErrors = $album.SourceDecodeErrors
+            AlbumMissingTitle       = $album.MissingTitle
+            AlbumMissingArtist      = $album.MissingArtist
+            AlbumMissingAlbum       = $album.MissingAlbum
+            AlbumMissingTrack       = $album.MissingTrack
+            AlbumMissingAlbumArtist = $album.MissingAlbumArtist
+            AlbumMissingEmbeddedArt = $album.MissingEmbeddedCover
+            AlbumArtworkFiles       = $album.ArtworkFiles
+            AlbumSuspiciousTitles   = $album.SuspiciousTitles
+            AlbumMetadataWarnings   = $album.MetadataWarnings
+            ForcedDemuxer           = $forcedDemuxer
+            VerifiedAt              = (Get-Date).ToString("o")
+        })
+    }
+
+    $rows |
+        Sort-Object VerificationStatus, AlbumDirectory, ReplacementPath |
+        Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($rows | Group-Object VerificationStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "VerificationStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+    foreach ($group in ($rows | Group-Object AlbumStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "AlbumStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+    foreach ($group in ($rows | Group-Object QueueStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "QueueStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " POST-REPLACEMENT VERIFICATION"
+    Write-Host ("=" * 72)
+    Write-Host "Committed transactions : $($transactions.Count)"
+
+    Write-Host ""
+    Write-Host "Verification status:"
+    if ($rows.Count -eq 0) {
+        Write-Host "  No committed replacement transactions found."
+    }
+    else {
+        foreach ($group in ($rows | Group-Object VerificationStatus | Sort-Object Count -Descending)) {
+            Write-Host ("  {0,-28} {1,6}" -f $group.Name,$group.Count)
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Queue status:"
+    foreach ($group in ($rows | Group-Object QueueStatus | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-28} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Album status:"
+    foreach ($group in ($rows | Group-Object AlbumStatus | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-28} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Files:"
+    Write-Host "  Verification : $reportPath"
+    Write-Host "  Summary      : $summaryPath"
+    Write-Host ""
+    Write-Host "Verification is read-only."
+    Write-Host "QueueStatus=ClearedByCurrentState is based on the actual current files, hashes, and strict decode."
+    Write-Host "The historical audit reports are not rewritten by this targeted verifier."
+}
+
+
+function Get-DecodeErrorSignature {
+    param([string]$ErrorText)
+
+    if ([string]::IsNullOrWhiteSpace($ErrorText)) {
+        return "(no decoder error text)"
+    }
+
+    $normalized = $ErrorText
+    $normalized = $normalized -replace '@\s*(?:0x)?[0-9A-Fa-f]{8,}', '@ <addr>'
+    $normalized = $normalized -replace '\[(png|mjpeg|jpeg|webp|gif)\s+@\s+<addr>\]', '[$1]'
+    $normalized = $normalized -replace '\[(mp3float|mp3|flac|aac|vorbis|opus|wmalossless|wmav2|alac)\s+@\s+<addr>\]', '[$1]'
+    $normalized = $normalized -replace '\s+', ' '
+
+    $rules = @(
+        @{ Pattern='\[png\].*chunk too big';                         Signature='PNG artwork: chunk too big' },
+        @{ Pattern='\[(?:mjpeg|jpeg)\].*No JPEG data found';         Signature='JPEG artwork: no JPEG data found' },
+        @{ Pattern='\[webp\].*';                                     Signature='WebP artwork decode error' },
+        @{ Pattern='\[gif\].*';                                      Signature='GIF artwork decode error' },
+        @{ Pattern='\[(?:mp3float|mp3)\].*invalid new backstep';     Signature='MP3 audio: invalid new backstep' },
+        @{ Pattern='\[(?:mp3float|mp3)\].*Header missing';           Signature='MP3 audio: header missing' },
+        @{ Pattern='Header missing';                                 Signature='Audio: header missing' },
+        @{ Pattern='Invalid data found when processing input';       Signature='Container: invalid input data' },
+        @{ Pattern='Incorrect BOM value';                            Signature='Container: incorrect BOM' },
+        @{ Pattern='Error while decoding stream';                    Signature='Audio: decode stream error' },
+        @{ Pattern='Error submitting packet to decoder';             Signature='Audio: packet submission error' },
+        @{ Pattern='Invalid frame size';                             Signature='Audio: invalid frame size' },
+        @{ Pattern='Failed to read frame size';                      Signature='Audio: failed to read frame size' },
+        @{ Pattern='CRC mismatch';                                   Signature='Audio: CRC mismatch' },
+        @{ Pattern='moov atom not found';                            Signature='Container: moov atom missing' },
+        @{ Pattern='Could not find codec parameters';                Signature='Container: codec parameters unavailable' },
+        @{ Pattern='Invalid argument';                               Signature='Container/decoder: invalid argument' },
+        @{ Pattern='End of file';                                    Signature='Container: unexpected EOF' }
+    )
+
+    foreach ($rule in $rules) {
+        if ($normalized -match $rule.Pattern) {
+            return $rule.Signature
+        }
+    }
+
+    $first = (($normalized -split '\s*\|\s*')[0]).Trim()
+    if ($first.Length -gt 180) {
+        $first = $first.Substring(0, 180)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($first)) {
+        return "(unclassified decoder error)"
+    }
+
+    return $first
+}
+
+function Get-DecodeErrorDomain {
+    param([string]$ErrorText)
+
+    if ([string]::IsNullOrWhiteSpace($ErrorText)) {
+        return "NONE"
+    }
+
+    $normalized = $ErrorText -replace '@\s*(?:0x)?[0-9A-Fa-f]{8,}', '@ <addr>'
+
+    $hasArtwork = $normalized -match '\[(?:png|mjpeg|jpeg|webp|gif)\b' -or
+                  $normalized -match 'No JPEG data found|chunk too big'
+
+    $hasAudio = $normalized -match '\[(?:mp3float|mp3|flac|aac|vorbis|opus|wmalossless|wmav2|alac)\b' -or
+                $normalized -match 'Header missing|invalid new backstep|Error while decoding stream|Error submitting packet to decoder|Invalid frame size|Failed to read frame size|CRC mismatch'
+
+    $hasContainer = $normalized -match 'Invalid data found when processing input|Incorrect BOM value|moov atom not found|Could not find codec parameters|Invalid argument|End of file'
+
+    if ($hasAudio -and $hasArtwork -and $hasContainer) { return "AUDIO+ARTWORK+CONTAINER" }
+    if ($hasAudio -and $hasArtwork) { return "AUDIO+ARTWORK" }
+    if ($hasAudio -and $hasContainer) { return "AUDIO+CONTAINER" }
+    if ($hasArtwork -and $hasContainer) { return "ARTWORK+CONTAINER" }
+    if ($hasAudio) { return "AUDIO" }
+    if ($hasArtwork) { return "ARTWORK" }
+    if ($hasContainer) { return "CONTAINER" }
+    return "UNKNOWN"
+}
+
+
+function Get-PrimaryDomainFromSignature {
+    param([string]$Signature)
+
+    if ([string]::IsNullOrWhiteSpace($Signature)) {
+        return "UNKNOWN"
+    }
+
+    switch -Regex ($Signature) {
+        '^MP3 audio:'         { return "AUDIO" }
+        '^Audio:'             { return "AUDIO" }
+        '^PNG artwork:'       { return "ARTWORK" }
+        '^JPEG artwork:'      { return "ARTWORK" }
+        '^WebP artwork'       { return "ARTWORK" }
+        '^GIF artwork'        { return "ARTWORK" }
+        '^Container:'         { return "CONTAINER" }
+        '^Container/decoder:' { return "CONTAINER" }
+        default               { return "UNKNOWN" }
+    }
+}
+
+function Get-FailureDisposition {
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [Nullable[double]]$ReportedSeconds,
+        [double]$DecodedSeconds,
+        [int]$TolerantExitCode
+    )
+
+    $ratio = $null
+    if ($null -ne $ReportedSeconds -and $ReportedSeconds -gt 0) {
+        $ratio = $DecodedSeconds / [double]$ReportedSeconds
+    }
+
+    if ($TolerantExitCode -ne 0) {
+        return [pscustomobject]@{
+            Severity = "Severe"
+            Action   = if ($Domain -eq "ARTWORK") { "RepairArtworkThenRetest" } else { "ReplacementReview" }
+        }
+    }
+
+    if ($null -eq $ratio) {
+        return [pscustomobject]@{
+            Severity = "DecodableWithErrors"
+            Action   = switch ($Domain) {
+                "ARTWORK"                 { "RepairArtwork" }
+                "CONTAINER"               { "ContainerReview" }
+                "AUDIO"                   { "AudioReview" }
+                "AUDIO+ARTWORK"           { "ManualReview" }
+                "AUDIO+CONTAINER"         { "ManualReview" }
+                "ARTWORK+CONTAINER"       { "ManualReview" }
+                "AUDIO+ARTWORK+CONTAINER" { "ManualReview" }
+                default                   { "ManualReview" }
+            }
+        }
+    }
+
+    if ($ratio -lt 0.95) {
+        return [pscustomobject]@{
+            Severity = "Severe"
+            Action   = if ($Domain -eq "ARTWORK") { "RepairArtworkThenRetest" } else { "ReplacementReview" }
+        }
+    }
+
+    if ($ratio -lt 0.99) {
+        return [pscustomobject]@{
+            Severity = "MostlyDecodable"
+            Action   = if ($Domain -eq "ARTWORK") { "RepairArtwork" } else { "AudioReview" }
+        }
+    }
+
+    switch ($Domain) {
+        "ARTWORK" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteArtworkError"
+                Action   = "RepairArtwork"
+            }
+        }
+        "CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteContainerError"
+                Action   = "ContainerReview"
+            }
+        }
+        "AUDIO" {
+            return [pscustomobject]@{
+                Severity = "AudioDegradedButComplete"
+                Action   = "AudioReview"
+            }
+        }
+        "AUDIO+ARTWORK" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        "AUDIO+CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        "ARTWORK+CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        "AUDIO+ARTWORK+CONTAINER" {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteMixedError"
+                Action   = "ManualReview"
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Severity = "AudioCompleteUnknownError"
+                Action   = "ManualReview"
+            }
+        }
+    }
+}
+
+function Test-ProbeFailureValue {
+    param($Value)
+
+    if ($null -eq $Value) { return $false }
+
+    $s = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($s)) { return $false }
+    if ($s -ieq "False") { return $false }
+    if ($s -eq "0") { return $false }
+
+    return $true
+}
+
+function Export-AuditFailureClassification {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IEnumerable]$Tracks,
+        [Parameter(Mandatory)]
+        [string]$OutputRoot
+    )
+
+    $all = @($Tracks)
+    $failed = @($all | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+
+    $byExtensionPath = Join-Path $OutputRoot "decode-failures-by-extension.csv"
+    $signaturePath = Join-Path $OutputRoot "decode-error-signatures.csv"
+    $byAlbumPath = Join-Path $OutputRoot "decode-failures-by-album.csv"
+    $crosscheckPath = Join-Path $OutputRoot "audit-crosscheck.csv"
+
+    $byExtension = @(
+        $all |
+        Group-Object {
+            $ext = [string]$_.Extension
+            if ([string]::IsNullOrWhiteSpace($ext)) {
+                $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+            }
+            if ([string]::IsNullOrWhiteSpace($ext)) { "(none)" } else { $ext.ToLowerInvariant() }
+        } |
+        ForEach-Object {
+            $items = @($_.Group)
+            $decodeFail = @($items | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+            $probeFail = @($items | Where-Object { Test-ProbeFailureValue $_.ProbeError })
+            $both = @($items | Where-Object {
+                $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" -and
+                (Test-ProbeFailureValue $_.ProbeError)
+            })
+
+            [pscustomobject]@{
+                Extension            = $_.Name
+                TotalFiles           = $items.Count
+                DecodePass           = @($items | Where-Object { $_.SourceDecodeStatus -eq "PASS" }).Count
+                DecodeFail           = $decodeFail.Count
+                DecodeFailPercent    = if ($items.Count) { [math]::Round(($decodeFail.Count / $items.Count) * 100, 2) } else { 0 }
+                ProbeErrors          = $probeFail.Count
+                DecodeAndProbeErrors = $both.Count
+            }
+        } |
+        Sort-Object @{Expression="DecodeFail";Descending=$true}, @{Expression="TotalFiles";Descending=$true}, Extension
+    )
+    $byExtension | Export-Csv -LiteralPath $byExtensionPath -NoTypeInformation -Encoding UTF8
+
+    $signatureRows = @(
+        $failed |
+        Group-Object { Get-DecodeErrorSignature ([string]$_.SourceDecodeError) } |
+        ForEach-Object {
+            $items = @($_.Group)
+            [pscustomobject]@{
+                Signature  = $_.Name
+                Files      = $items.Count
+                Albums     = @($items.Directory | Where-Object { $_ } | Sort-Object -Unique).Count
+                Extensions = (@(
+                    $items | ForEach-Object {
+                        $ext = [string]$_.Extension
+                        if ([string]::IsNullOrWhiteSpace($ext)) {
+                            $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+                        }
+                        if ($ext) { $ext.ToLowerInvariant() }
+                    } | Where-Object { $_ } | Sort-Object -Unique
+                ) -join "; ")
+            }
+        } |
+        Sort-Object @{Expression="Files";Descending=$true}, Signature
+    )
+    $signatureRows | Export-Csv -LiteralPath $signaturePath -NoTypeInformation -Encoding UTF8
+
+    $albumRows = @(
+        $all |
+        Group-Object Directory |
+        ForEach-Object {
+            $items = @($_.Group)
+            $bad = @($items | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+
+            if ($bad.Count -eq 0) { return }
+
+            $pattern =
+                if ($bad.Count -eq $items.Count) { "WholeAlbum" }
+                elseif ($bad.Count -eq 1) { "IsolatedTrack" }
+                elseif (($bad.Count / [math]::Max($items.Count, 1)) -ge 0.5) { "MostlyAlbum" }
+                else { "PartialAlbum" }
+
+            [pscustomobject]@{
+                AlbumDirectory = $_.Name
+                Artist         = Get-DominantValue $items.Artist
+                Album          = Get-DominantValue $items.Album
+                Tracks         = $items.Count
+                DecodeFailures = $bad.Count
+                FailurePercent = [math]::Round(($bad.Count / [math]::Max($items.Count, 1)) * 100, 2)
+                Pattern        = $pattern
+                Extensions     = (@(
+                    $items | ForEach-Object {
+                        $ext = [string]$_.Extension
+                        if ([string]::IsNullOrWhiteSpace($ext)) {
+                            $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+                        }
+                        if ($ext) { $ext.ToLowerInvariant() }
+                    } | Where-Object { $_ } | Sort-Object -Unique
+                ) -join "; ")
+            }
+        } |
+        Sort-Object @{Expression="DecodeFailures";Descending=$true}, @{Expression="FailurePercent";Descending=$true}, AlbumDirectory
+    )
+    $albumRows | Export-Csv -LiteralPath $byAlbumPath -NoTypeInformation -Encoding UTF8
+
+    $crosscheckRows = @(
+        $all |
+        ForEach-Object {
+            $decodeFail = $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR"
+            $probeFail = Test-ProbeFailureValue $_.ProbeError
+
+            $category =
+                if ($decodeFail -and $probeFail) { "Decode+Probe" }
+                elseif ($decodeFail) { "DecodeOnly" }
+                elseif ($probeFail) { "ProbeOnly" }
+                else { "Neither" }
+
+            $ext = [string]$_.Extension
+            if ([string]::IsNullOrWhiteSpace($ext)) {
+                $ext = [System.IO.Path]::GetExtension([string]$_.Path)
+            }
+
+            [pscustomobject]@{
+                Category = $category
+                Path = $_.Path
+                Directory = $_.Directory
+                FileName = $_.FileName
+                Extension = if ($ext) { $ext.ToLowerInvariant() } else { "(none)" }
+                SourceDecodeStatus = $_.SourceDecodeStatus
+                DecodeSignature = if ($decodeFail) { Get-DecodeErrorSignature ([string]$_.SourceDecodeError) } else { $null }
+                ProbeError = $_.ProbeError
+            }
+        }
+    )
+    $crosscheckRows | Export-Csv -LiteralPath $crosscheckPath -NoTypeInformation -Encoding UTF8
+
+    $patternSummary = @(
+        $albumRows |
+        Group-Object Pattern |
+        ForEach-Object {
+            [pscustomobject]@{
+                Pattern = $_.Name
+                Albums = $_.Count
+                FailedTracks = [int](@($_.Group | Measure-Object DecodeFailures -Sum).Sum)
+            }
+        } |
+        Sort-Object @{Expression="FailedTracks";Descending=$true}
+    )
+
+    $crossSummary = @(
+        $crosscheckRows |
+        Group-Object Category |
+        ForEach-Object {
+            [pscustomobject]@{ Category = $_.Name; Files = $_.Count }
+        } |
+        Sort-Object @{Expression="Files";Descending=$true}
+    )
+
+    return [pscustomobject]@{
+        FailedTracks     = $failed.Count
+        FailureAlbums    = $albumRows.Count
+        ByExtension      = $byExtension
+        Signatures       = $signatureRows
+        AlbumPatterns    = $patternSummary
+        Crosscheck       = $crossSummary
+        ByExtensionPath  = $byExtensionPath
+        SignaturePath    = $signaturePath
+        ByAlbumPath      = $byAlbumPath
+        CrosscheckPath   = $crosscheckPath
+    }
+}
+
+function Show-AuditFailureClassification {
+    param(
+        [Parameter(Mandatory)]
+        $Classification
+    )
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " SOURCE FAILURE CLASSIFICATION"
+    Write-Host ("=" * 72)
+    Write-Host "Failed tracks  : $($Classification.FailedTracks)"
+    Write-Host "Affected albums: $($Classification.FailureAlbums)"
+
+    Write-Host ""
+    Write-Host "Failures by extension:"
+    foreach ($row in @($Classification.ByExtension | Where-Object { $_.DecodeFail -gt 0 } | Select-Object -First 12)) {
+        Write-Host ("  {0,-8} {1,6} fail / {2,6} total  ({3,6}%)" -f $row.Extension,$row.DecodeFail,$row.TotalFiles,$row.DecodeFailPercent)
+    }
+
+    Write-Host ""
+    Write-Host "Top decoder signatures:"
+    foreach ($row in @($Classification.Signatures | Select-Object -First 12)) {
+        Write-Host ("  {0,6}  {1}" -f $row.Files,$row.Signature)
+    }
+
+    Write-Host ""
+    Write-Host "Failure concentration:"
+    foreach ($row in $Classification.AlbumPatterns) {
+        Write-Host ("  {0,-14} {1,5} album(s), {2,6} failed track(s)" -f $row.Pattern,$row.Albums,$row.FailedTracks)
+    }
+
+    Write-Host ""
+    Write-Host "ffprobe / strict-decode cross-check:"
+    foreach ($row in $Classification.Crosscheck) {
+        Write-Host ("  {0,-14} {1,6}" -f $row.Category,$row.Files)
+    }
+
+    Write-Host ""
+    Write-Host "Classification reports:"
+    Write-Host "  $($Classification.ByExtensionPath)"
+    Write-Host "  $($Classification.SignaturePath)"
+    Write-Host "  $($Classification.ByAlbumPath)"
+    Write-Host "  $($Classification.CrosscheckPath)"
+}
+
+
+function Invoke-AuditFailureRecheck {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TrackReportPath,
+        [Parameter(Mandatory)]
+        [string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $TrackReportPath -PathType Leaf)) {
+        throw "Existing audit report not found: $TrackReportPath`nRun -AuditOnly first."
+    }
+
+    $rows = @(Import-Csv -LiteralPath $TrackReportPath)
+    $oldFailures = @($rows | Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" })
+    $reportPath = Join-Path $OutputRoot "audio-only-recheck.csv"
+
+    Write-Host "Existing strict-decode failures: $($oldFailures.Count)"
+    Write-Host "Rechecking only those files with non-audio streams disabled..."
+    Write-Host ""
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $i = 0
+
+    foreach ($row in $oldFailures) {
+        $i++
+        Write-Progress -Activity "Audio-only failure recheck" -Status "$i / $($oldFailures.Count)" -PercentComplete (($i / [math]::Max($oldFailures.Count,1)) * 100)
+
+        $path = [string]$row.Path
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                Path             = $path
+                FileName         = $row.FileName
+                Directory        = $row.Directory
+                Extension        = $row.Extension
+                PreviousStatus   = $row.SourceDecodeStatus
+                RecheckStatus    = "MISSING FILE"
+                RecheckExitCode  = $null
+                RecheckError     = "File no longer exists."
+                PreviousError    = $row.SourceDecodeError
+            })
+            continue
+        }
+
+        $decode = Test-SourceAudioDecode -File (Get-Item -LiteralPath $path)
+        $results.Add([pscustomobject]@{
+            Path             = $path
+            FileName         = $row.FileName
+            Directory        = $row.Directory
+            Extension        = if ($row.Extension) { $row.Extension } else { [System.IO.Path]::GetExtension($path) }
+            PreviousStatus   = $row.SourceDecodeStatus
+            RecheckStatus    = if ($decode.Clean) { "PASS" } else { "SOURCE AUDIO ERROR" }
+            RecheckExitCode  = $decode.ExitCode
+            RecheckError     = $decode.ErrorText
+            PreviousError    = $row.SourceDecodeError
+        })
+    }
+
+    Write-Progress -Activity "Audio-only failure recheck" -Completed
+
+    $results | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+    $pass = @($results | Where-Object { $_.RecheckStatus -eq "PASS" }).Count
+    $fail = @($results | Where-Object { $_.RecheckStatus -eq "SOURCE AUDIO ERROR" }).Count
+    $missing = @($results | Where-Object { $_.RecheckStatus -eq "MISSING FILE" }).Count
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " AUDIO-ONLY FAILURE RECHECK COMPLETE"
+    Write-Host ("=" * 72)
+    Write-Host "Previously failed : $($oldFailures.Count)"
+    Write-Host "Now PASS          : $pass"
+    Write-Host "Still audio error : $fail"
+    Write-Host "Missing files     : $missing"
+    Write-Host ""
+    Write-Host "Report:"
+    Write-Host "  $reportPath"
+    Write-Host ""
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+}
+
+
+function Get-ReportedAudioDurationSeconds {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $raw = @(
+        & ffprobe -v error -select_streams a:0 `
+            -show_entries format=duration `
+            -of default=noprint_wrappers=1:nokey=1 `
+            -- $Path 2>&1
+    )
+
+    if ($LASTEXITCODE -ne 0) { return $null }
+
+    $value = 0.0
+    if ([double]::TryParse(
+        (($raw | Select-Object -First 1) -as [string]),
+        [System.Globalization.NumberStyles]::Float,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [ref]$value
+    )) { return $value }
+
+    return $null
+}
+
+function Invoke-TolerantAudioDecodeDiagnostic {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $output = @(
+        & ffmpeg -hide_banner -v error `
+            -vn -sn -dn -i $Path `
+            -map 0:a:0 -vn -sn -dn `
+            -progress pipe:1 -nostats `
+            -f null - 2>&1
+    )
+    $exitCode = $LASTEXITCODE
+    $maxOutTimeUs = 0L
+    $errorLines = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($lineObj in $output) {
+        $line = [string]$lineObj
+
+        if ($line -match '^out_time_us=(\d+)$') {
+            $v = 0L
+            if ([long]::TryParse($Matches[1], [ref]$v) -and $v -gt $maxOutTimeUs) {
+                $maxOutTimeUs = $v
+            }
+            continue
+        }
+
+        if ($line -match '^(progress|bitrate|total_size|out_time_ms|out_time|dup_frames|drop_frames|speed|stream_\d+_\d+_q)=') {
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($line)) {
+            $errorLines.Add($line.Trim())
+        }
+    }
+
+    $errorText = $errorLines -join " | "
+
+    [pscustomobject]@{
+        ExitCode       = $exitCode
+        DecodedSeconds = if ($maxOutTimeUs -gt 0) { [math]::Round(($maxOutTimeUs / 1000000.0), 3) } else { 0.0 }
+        ErrorText      = $errorText
+        ErrorSignature = Get-DecodeErrorSignature $errorText
+    }
+}
+
+
+
+function Invoke-ReclassifyFailureDomains {
+    param(
+        [Parameter(Mandatory)][string]$ClassificationReportPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $ClassificationReportPath -PathType Leaf)) {
+        throw "Existing failure classification report not found: $ClassificationReportPath`nRun -ClassifyAuditFailures first."
+    }
+
+    $rows = @(Import-Csv -LiteralPath $ClassificationReportPath)
+    if ($rows.Count -eq 0) {
+        Write-Host "Existing failure classification report is empty."
+        return
+    }
+
+    $outPath = Join-Path $OutputRoot "failure-classification-reclassified.csv"
+    $summaryPath = Join-Path $OutputRoot "failure-classification-reclassified-summary.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($row in $rows) {
+        $signature = [string]$row.Signature
+        $primaryDomain = Get-PrimaryDomainFromSignature $signature
+
+        $evidenceDomain = if ($row.PSObject.Properties.Name -contains "EvidenceDomain" -and $row.EvidenceDomain) {
+            [string]$row.EvidenceDomain
+        }
+        elseif ($row.PSObject.Properties.Name -contains "Domain" -and $row.Domain) {
+            [string]$row.Domain
+        }
+        else {
+            Get-DecodeErrorDomain ([string]$row.StrictError)
+        }
+
+        $reported = $null
+        if ($row.ReportedDurationSeconds -ne "") {
+            $tmpReported = 0.0
+            if ([double]::TryParse(
+                [string]$row.ReportedDurationSeconds,
+                [System.Globalization.NumberStyles]::Float,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$tmpReported
+            )) {
+                $reported = $tmpReported
+            }
+        }
+
+        $decoded = 0.0
+        $tmpDecoded = 0.0
+        if ([double]::TryParse(
+            [string]$row.DecodedDurationSeconds,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$tmpDecoded
+        )) {
+            $decoded = $tmpDecoded
+        }
+
+        $exitCode = 0
+        $tmpExit = 0
+        if ([int]::TryParse([string]$row.TolerantExitCode, [ref]$tmpExit)) {
+            $exitCode = $tmpExit
+        }
+
+        if ([string]$row.Severity -eq "MissingFile") {
+            $severity = "MissingFile"
+            $action = "LocateFile"
+        }
+        else {
+            $disp = Get-FailureDisposition `
+                -Domain $primaryDomain `
+                -ReportedSeconds $reported `
+                -DecodedSeconds $decoded `
+                -TolerantExitCode $exitCode
+            $severity = $disp.Severity
+            $action = $disp.Action
+        }
+
+        $results.Add([pscustomobject]@{
+            Path                    = $row.Path
+            Directory               = $row.Directory
+            FileName                = $row.FileName
+            Extension               = $row.Extension
+            Signature               = $signature
+            PrimaryDomain           = $primaryDomain
+            EvidenceDomain          = $evidenceDomain
+            Severity                = $severity
+            Action                  = $action
+            ReportedDurationSeconds = $row.ReportedDurationSeconds
+            DecodedDurationSeconds  = $row.DecodedDurationSeconds
+            DecodedPercent          = $row.DecodedPercent
+            TolerantExitCode        = $row.TolerantExitCode
+            TolerantErrorSignature  = $row.TolerantErrorSignature
+            TolerantError           = $row.TolerantError
+            StrictError             = $row.StrictError
+        })
+    }
+
+    $results |
+        Sort-Object Action, PrimaryDomain, Signature, Directory, FileName |
+        Export-Csv -LiteralPath $outPath -NoTypeInformation -Encoding UTF8
+
+    $summaryRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($category in @("Action","PrimaryDomain","EvidenceDomain","Severity","Signature")) {
+        foreach ($group in ($results | Group-Object $category | Sort-Object Count -Descending)) {
+            $summaryRows.Add([pscustomobject]@{
+                Category = $category
+                Name     = $group.Name
+                Count    = $group.Count
+            })
+        }
+    }
+
+    $summaryRows | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " FAILURE DOMAIN RECLASSIFICATION COMPLETE"
+    Write-Host ("=" * 72)
+
+    Write-Host ""
+    Write-Host "Recommended disposition:"
+    foreach ($group in ($results | Group-Object Action | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-26} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By primary domain:"
+    foreach ($group in ($results | Group-Object PrimaryDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By evidence domain:"
+    foreach ($group in ($results | Group-Object EvidenceDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $outPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "Existing decode measurements were reused; no audio was decoded again."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+}
+
+function Invoke-FullFailureClassification {
+    param(
+        [Parameter(Mandatory)][string]$RecheckReportPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $RecheckReportPath -PathType Leaf)) {
+        throw "Audio-only recheck report not found: $RecheckReportPath`nRun -RecheckAuditFailures first."
+    }
+
+    $rows = @(
+        Import-Csv -LiteralPath $RecheckReportPath |
+        Where-Object { $_.RecheckStatus -eq "SOURCE AUDIO ERROR" }
+    )
+
+    if ($rows.Count -eq 0) {
+        Write-Host "No SOURCE AUDIO ERROR rows exist in the recheck report."
+        return
+    }
+
+    $reportPath = Join-Path $OutputRoot "failure-classification.csv"
+    $summaryPath = Join-Path $OutputRoot "failure-classification-summary.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    Write-Host "Failures to classify : $($rows.Count)"
+    Write-Host "This performs a tolerant audio decode of each failed file."
+    Write-Host ""
+
+    $i = 0
+    foreach ($row in $rows) {
+        $i++
+        $path = [string]$row.Path
+        $signature = Get-DecodeErrorSignature ([string]$row.RecheckError)
+        $evidenceDomain = Get-DecodeErrorDomain ([string]$row.RecheckError)
+        $primaryDomain = Get-PrimaryDomainFromSignature $signature
+
+        Write-Progress `
+            -Activity "Classifying audit failures" `
+            -Status "$i / $($rows.Count)" `
+            -PercentComplete (($i / [math]::Max($rows.Count,1)) * 100)
+
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                Path                    = $path
+                Directory               = $row.Directory
+                FileName                = $row.FileName
+                Extension               = $row.Extension
+                Signature               = $signature
+                PrimaryDomain           = $primaryDomain
+                EvidenceDomain          = $evidenceDomain
+                Severity                = "MissingFile"
+                Action                  = "LocateFile"
+                ReportedDurationSeconds = $null
+                DecodedDurationSeconds  = $null
+                DecodedPercent          = $null
+                TolerantExitCode        = $null
+                TolerantErrorSignature  = $null
+                TolerantError           = "File no longer exists."
+                StrictError             = $row.RecheckError
+            })
+            continue
+        }
+
+        $reported = Get-ReportedAudioDurationSeconds -Path $path
+        $diag = Invoke-TolerantAudioDecodeDiagnostic -Path $path
+        $disposition = Get-FailureDisposition `
+            -Domain $primaryDomain `
+            -ReportedSeconds $reported `
+            -DecodedSeconds $diag.DecodedSeconds `
+            -TolerantExitCode $diag.ExitCode
+
+        $percent = $null
+        if ($null -ne $reported -and $reported -gt 0) {
+            $percent = [math]::Round(($diag.DecodedSeconds / [double]$reported) * 100, 2)
+        }
+
+        $results.Add([pscustomobject]@{
+            Path                    = $path
+            Directory               = $row.Directory
+            FileName                = $row.FileName
+            Extension               = if ($row.Extension) { $row.Extension } else { [System.IO.Path]::GetExtension($path) }
+            Signature               = $signature
+            PrimaryDomain           = $primaryDomain
+            EvidenceDomain          = $evidenceDomain
+            Severity                = $disposition.Severity
+            Action                  = $disposition.Action
+            ReportedDurationSeconds = $reported
+            DecodedDurationSeconds  = $diag.DecodedSeconds
+            DecodedPercent          = $percent
+            TolerantExitCode        = $diag.ExitCode
+            TolerantErrorSignature  = $diag.ErrorSignature
+            TolerantError           = $diag.ErrorText
+            StrictError             = $row.RecheckError
+        })
+    }
+
+    Write-Progress -Activity "Classifying audit failures" -Completed
+
+    $results |
+        Sort-Object Action, PrimaryDomain, Signature, Directory, FileName |
+        Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+    $summaryRows = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($group in ($results | Group-Object Action | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "Action"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object PrimaryDomain | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "PrimaryDomain"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object EvidenceDomain | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "EvidenceDomain"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object Severity | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "Severity"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object Signature | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "Signature"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summaryRows |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " FULL FAILURE CLASSIFICATION COMPLETE"
+    Write-Host ("=" * 72)
+
+    Write-Host ""
+    Write-Host "Recommended disposition:"
+    foreach ($group in ($results | Group-Object Action | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-26} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By primary domain:"
+    foreach ($group in ($results | Group-Object PrimaryDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By evidence domain:"
+    foreach ($group in ($results | Group-Object EvidenceDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By severity:"
+    foreach ($group in ($results | Group-Object Severity | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-30} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Canonical signatures:"
+    foreach ($group in ($results | Group-Object Signature | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,6}  {1}" -f $group.Count,$group.Name)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $reportPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "Classification is diagnostic only; replacement state was not changed."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+}
+
+function Invoke-FailureSeverityAnalysis {
+    param(
+        [Parameter(Mandatory)][string]$RecheckReportPath,
+        [Parameter(Mandatory)][string]$OutputRoot,
+        [Parameter(Mandatory)][int]$SamplesPerSignature
+    )
+
+    if (-not (Test-Path -LiteralPath $RecheckReportPath -PathType Leaf)) {
+        throw "Audio-only recheck report not found: $RecheckReportPath`nRun -RecheckAuditFailures first."
+    }
+
+    $rows = @(
+        Import-Csv -LiteralPath $RecheckReportPath |
+        Where-Object { $_.RecheckStatus -eq "SOURCE AUDIO ERROR" }
+    )
+
+    if ($rows.Count -eq 0) {
+        Write-Host "No SOURCE AUDIO ERROR rows exist in the recheck report."
+        return
+    }
+
+    $withSignature = @(
+        foreach ($row in $rows) {
+            [pscustomobject]@{
+                Row       = $row
+                Signature = Get-DecodeErrorSignature ([string]$row.RecheckError)
+                Domain    = Get-DecodeErrorDomain ([string]$row.RecheckError)
+            }
+        }
+    )
+
+    $selected = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($group in ($withSignature | Group-Object Signature | Sort-Object Count -Descending)) {
+        $albumGroups = @($group.Group | Group-Object { $_.Row.Directory })
+        $taken = 0
+
+        foreach ($album in $albumGroups) {
+            if ($taken -ge $SamplesPerSignature) { break }
+            $selected.Add(@($album.Group | Select-Object -First 1)[0])
+            $taken++
+        }
+
+        if ($taken -lt $SamplesPerSignature) {
+            $already = @{}
+            foreach ($s in $selected) {
+                if ($s.Signature -eq $group.Name) { $already[[string]$s.Row.Path] = $true }
+            }
+
+            foreach ($candidate in $group.Group) {
+                if ($taken -ge $SamplesPerSignature) { break }
+                if (-not $already.ContainsKey([string]$candidate.Row.Path)) {
+                    $selected.Add($candidate)
+                    $already[[string]$candidate.Row.Path] = $true
+                    $taken++
+                }
+            }
+        }
+    }
+
+    $reportPath = Join-Path $OutputRoot "failure-severity-samples.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    Write-Host "Known strict audit failures : $($rows.Count)"
+    Write-Host "Canonical signatures        : $(($withSignature | Group-Object Signature).Count)"
+    Write-Host "Error domains               : $(($withSignature | Group-Object Domain).Count)"
+    Write-Host "Samples per signature       : $SamplesPerSignature"
+    Write-Host "Files selected              : $($selected.Count)"
+    Write-Host ""
+
+    $i = 0
+    foreach ($sample in $selected) {
+        $i++
+        $row = $sample.Row
+        $path = [string]$row.Path
+
+        Write-Progress -Activity "Failure severity analysis" `
+            -Status "$i / $($selected.Count)" `
+            -PercentComplete (($i / [math]::Max($selected.Count,1)) * 100)
+
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                Signature=$sample.Signature; Domain=$sample.Domain
+                Severity="MissingFile"; Action="LocateFile"; Path=$path
+                Directory=$row.Directory; FileName=$row.FileName; Extension=$row.Extension
+                ReportedDurationSeconds=$null; DecodedDurationSeconds=$null; DecodedPercent=$null
+                TolerantExitCode=$null; TolerantErrorSignature=$null
+                TolerantError="File no longer exists."; StrictError=$row.RecheckError
+            })
+            continue
+        }
+
+        $reported = Get-ReportedAudioDurationSeconds -Path $path
+        $diag = Invoke-TolerantAudioDecodeDiagnostic -Path $path
+        $disposition = Get-FailureDisposition `
+            -Domain $sample.Domain `
+            -ReportedSeconds $reported `
+            -DecodedSeconds $diag.DecodedSeconds `
+            -TolerantExitCode $diag.ExitCode
+
+        $percent = $null
+        if ($null -ne $reported -and $reported -gt 0) {
+            $percent = [math]::Round(($diag.DecodedSeconds / [double]$reported) * 100, 2)
+        }
+
+        $results.Add([pscustomobject]@{
+            Signature=$sample.Signature; Domain=$sample.Domain
+            Severity=$disposition.Severity; Action=$disposition.Action; Path=$path
+            Directory=$row.Directory; FileName=$row.FileName
+            Extension=if ($row.Extension) { $row.Extension } else { [System.IO.Path]::GetExtension($path) }
+            ReportedDurationSeconds=$reported; DecodedDurationSeconds=$diag.DecodedSeconds
+            DecodedPercent=$percent; TolerantExitCode=$diag.ExitCode
+            TolerantErrorSignature=$diag.ErrorSignature; TolerantError=$diag.ErrorText
+            StrictError=$row.RecheckError
+        })
+    }
+
+    Write-Progress -Activity "Failure severity analysis" -Completed
+
+    $results | Sort-Object Domain, Signature, Severity, Directory, FileName |
+        Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+    $summary = @(
+        $results | Group-Object Severity | ForEach-Object {
+            [pscustomobject]@{ Severity=$_.Name; Samples=$_.Count }
+        } | Sort-Object Samples -Descending
+    )
+
+    $domainSummary = @(
+        $results | Group-Object Domain | ForEach-Object {
+            [pscustomobject]@{ Domain=$_.Name; Samples=$_.Count }
+        } | Sort-Object Samples -Descending
+    )
+
+    $actionSummary = @(
+        $results | Group-Object Action | ForEach-Object {
+            [pscustomobject]@{ Action=$_.Name; Samples=$_.Count }
+        } | Sort-Object Samples -Descending
+    )
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " FAILURE SEVERITY SAMPLE ANALYSIS"
+    Write-Host ("=" * 72)
+    foreach ($row in $summary) {
+        Write-Host ("  {0,-30} {1,6}" -f $row.Severity,$row.Samples)
+    }
+
+    Write-Host ""
+    Write-Host "By error domain:"
+    foreach ($row in $domainSummary) {
+        Write-Host ("  {0,-12} {1,6}" -f $row.Domain,$row.Samples)
+    }
+
+    Write-Host ""
+    Write-Host "Recommended disposition:"
+    foreach ($row in $actionSummary) {
+        Write-Host ("  {0,-26} {1,6}" -f $row.Action,$row.Samples)
+    }
+
+    Write-Host ""
+    Write-Host "Per-signature sample results:"
+    foreach ($group in ($results | Group-Object Signature | Sort-Object Count -Descending)) {
+        $parts = @($group.Group | Group-Object Severity | ForEach-Object { "$($_.Name)=$($_.Count)" })
+        $domain = @($group.Group.Domain | Sort-Object -Unique) -join "+"
+        Write-Host ("  {0,6} sample(s)  [{1}] {2}" -f $group.Count,$domain,$group.Name)
+        Write-Host ("           " + ($parts -join ", "))
+    }
+
+    Write-Host ""
+    Write-Host "Report:"
+    Write-Host "  $reportPath"
+    Write-Host ""
+    Write-Host "Classification is diagnostic only; replacement state was not changed."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
 }
 
 function Get-FFProbeInfo {
@@ -822,7 +4454,8 @@ function Test-TempTrack {
     # -xerror makes any decoder error fatal so a "PASS" really means a clean decode.
     $decodeOutput = @(
         & ffmpeg -hide_banner -v error -xerror -err_detect explode `
-            -i $TempPath -map 0:a:0 -f null - 2>&1
+            -vn -sn -dn -i $TempPath `
+            -map 0:a:0 -vn -sn -dn -f null - 2>&1
     )
 
     if ($LASTEXITCODE -ne 0 -or $decodeOutput.Count -gt 0) {
@@ -1207,19 +4840,223 @@ function Invoke-ApprovedApply {
 }
 
 if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw "Root directory does not exist: $Root" }
-if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) { throw "ffprobe was not found in PATH." }
+
+$exclusiveModes = @(
+    @(
+        [bool]$AuditOnly,
+        [bool]$AnalyzeAuditReports,
+        [bool]$RecheckAuditFailures,
+        [bool]$AnalyzeFailureSeverity,
+        [bool]$ClassifyAuditFailures,
+        [bool]$ReclassifyFailureDomains,
+        [bool]$BuildRepairQueue,
+        [bool]$AnalyzeReplacementReview,
+        [bool]$AnalyzeReplacementEvidence,
+        [bool]$ReviewReplacementCandidates,
+        [bool]$StageReplacementCandidates,
+        [bool]$ApplyStagedReplacements,
+        [bool]$VerifyReplacementTransactions,
+        [bool]$ApplyApproved
+    ) | Where-Object { $_ }
+)
+
+if ($exclusiveModes.Count -gt 1) {
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, -ReviewReplacementCandidates, -StageReplacementCandidates, -ApplyStagedReplacements, -VerifyReplacementTransactions, and -ApplyApproved are mutually exclusive modes."
+}
+
+if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not $BuildRepairQueue -and -not $AnalyzeReplacementReview -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+    throw "ffprobe was not found in PATH."
+}
+
+if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates -or $ApplyStagedReplacements -or $VerifyReplacementTransactions) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+    throw "ffmpeg was not found in PATH."
+}
+if (($AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+    throw "ffprobe was not found in PATH."
+}
 
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
+
+# Audit/report-analysis output is intentionally isolated from persistent repair
+# state so whole-library analysis cannot overwrite an in-progress review.
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates -or $ApplyStagedReplacements -or $VerifyReplacementTransactions) { Join-Path $StateRoot "audit" } else { $StateRoot }
+New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
+
 $StateFile = Join-Path $StateRoot "state.json"
-$TrackReport = Join-Path $StateRoot "tracks.csv"
-$AlbumReport = Join-Path $StateRoot "albums.csv"
-$PlanReport = Join-Path $StateRoot "rename-plan.csv"
+$TrackReport = Join-Path $ReportRoot "tracks.csv"
+$AlbumReport = Join-Path $ReportRoot "albums.csv"
+$PlanReport = Join-Path $ReportRoot "rename-plan.csv"
+$ReplacementReport = Join-Path $ReportRoot "source-decode-observations.csv"
+$DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
+$AudioOnlyRecheckReport = Join-Path $ReportRoot "audio-only-recheck.csv"
+$FailureClassificationReport = Join-Path $ReportRoot "failure-classification.csv"
+$FailureReclassifiedReport = Join-Path $ReportRoot "failure-classification-reclassified.csv"
+$RepairActionQueueReport = Join-Path $ReportRoot "repair-action-queue.csv"
+$ReplacementReviewAnalysisReport = Join-Path $ReportRoot "replacement-review-analysis.csv"
+$ReplacementEvidenceAnalysisReport = Join-Path $ReportRoot "replacement-evidence-analysis.csv"
+$ReplacementCandidateIntakeReport = Join-Path $ReportRoot "replacement-candidate-intake.csv"
+$ReplacementCandidateValidationReport = Join-Path $ReportRoot "replacement-candidate-validation.csv"
+$ReplacementStagingRoot = Join-Path $StateRoot "staging"
+$ReplacementStagingManifestReport = Join-Path $ReportRoot "replacement-staging-manifest.csv"
+$ReplacementTransactionManifestReport = Join-Path $ReportRoot "replacement-transaction-manifest.csv"
+$ReplacementBackupRoot = Join-Path $StateRoot "replacement-backups"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
-Write-Host ("Mode : " + $(if ($ApplyApproved) { "APPLY APPROVED" } else { "READ-ONLY discovery/review" }))
+$modeName = if ($ApplyApproved) {
+    "APPLY APPROVED"
+}
+elseif ($VerifyReplacementTransactions) {
+    "VERIFY REPLACEMENT TRANSACTIONS"
+}
+elseif ($ApplyStagedReplacements) {
+    "APPLY STAGED REPLACEMENTS"
+}
+elseif ($StageReplacementCandidates) {
+    "STAGE REPLACEMENT CANDIDATES"
+}
+elseif ($ReviewReplacementCandidates) {
+    "REVIEW REPLACEMENT CANDIDATES"
+}
+elseif ($AnalyzeReplacementEvidence) {
+    "ANALYZE REPLACEMENT EVIDENCE"
+}
+elseif ($AnalyzeReplacementReview) {
+    "ANALYZE REPLACEMENT REVIEW"
+}
+elseif ($BuildRepairQueue) {
+    "BUILD REPAIR QUEUE"
+}
+elseif ($ReclassifyFailureDomains) {
+    "RECLASSIFY FAILURE DOMAINS"
+}
+elseif ($ClassifyAuditFailures) {
+    "CLASSIFY ALL AUDIT FAILURES"
+}
+elseif ($AnalyzeFailureSeverity) {
+    "ANALYZE FAILURE SEVERITY"
+}
+elseif ($RecheckAuditFailures) {
+    "RECHECK AUDIT FAILURES"
+}
+elseif ($AnalyzeAuditReports) {
+    "ANALYZE AUDIT REPORTS"
+}
+elseif ($AuditOnly) {
+    "AUDIT ONLY"
+}
+else {
+    "READ-ONLY discovery/review"
+}
+Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($VerifyReplacementTransactions) {
+    Invoke-VerifyReplacementTransactions `
+        -TransactionManifestPath $ReplacementTransactionManifestReport `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($ApplyStagedReplacements) {
+    Invoke-ApplyStagedReplacements `
+        -CandidateIntakePath $ReplacementCandidateIntakeReport `
+        -StagingManifestPath $ReplacementStagingManifestReport `
+        -BackupRoot $ReplacementBackupRoot `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($StageReplacementCandidates) {
+    Invoke-StageReplacementCandidates `
+        -CandidateIntakePath $ReplacementCandidateIntakeReport `
+        -CandidateValidationPath $ReplacementCandidateValidationReport `
+        -StagingRoot $ReplacementStagingRoot `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($ReviewReplacementCandidates) {
+    Invoke-ReviewReplacementCandidates `
+        -EvidenceAnalysisPath $ReplacementEvidenceAnalysisReport `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($AnalyzeReplacementEvidence) {
+    Invoke-AnalyzeReplacementEvidence `
+        -ReplacementReviewAnalysisPath $ReplacementReviewAnalysisReport `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($AnalyzeReplacementReview) {
+    Invoke-AnalyzeReplacementReview `
+        -RepairQueuePath $RepairActionQueueReport `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($BuildRepairQueue) {
+    Invoke-BuildRepairQueue `
+        -OutputRoot $ReportRoot `
+        -ReclassifiedReportPath $FailureReclassifiedReport `
+        -ClassificationReportPath $FailureClassificationReport `
+        -TrackReportPath $TrackReport
+    return
+}
+
+if ($ReclassifyFailureDomains) {
+    Invoke-ReclassifyFailureDomains `
+        -ClassificationReportPath $FailureClassificationReport `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($ClassifyAuditFailures) {
+    Invoke-FullFailureClassification `
+        -RecheckReportPath $AudioOnlyRecheckReport `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($AnalyzeFailureSeverity) {
+    Invoke-FailureSeverityAnalysis `
+        -RecheckReportPath $AudioOnlyRecheckReport `
+        -OutputRoot $ReportRoot `
+        -SamplesPerSignature $FailureSamplesPerSignature
+    return
+}
+
+if ($RecheckAuditFailures) {
+    Invoke-AuditFailureRecheck -TrackReportPath $TrackReport -OutputRoot $ReportRoot
+    return
+}
+
+if ($AnalyzeAuditReports) {
+    if (-not (Test-Path -LiteralPath $TrackReport -PathType Leaf)) {
+        throw "Existing audit report not found: $TrackReport`nRun -AuditOnly first."
+    }
+
+    Write-Host "Loading existing audit report:"
+    Write-Host "  $TrackReport"
+
+    $existingTracks = @(Import-Csv -LiteralPath $TrackReport)
+    Write-Host "Tracks loaded: $($existingTracks.Count)"
+
+    $classification = Export-AuditFailureClassification -Tracks $existingTracks -OutputRoot $ReportRoot
+    Show-AuditFailureClassification -Classification $classification
+
+    Write-Host ""
+    Write-Host "No media files were decoded or modified."
+    Write-Host ""
+    Write-Host "Decode observations are evidence only; they do NOT authorize replacement."
+    Write-Host "Use -ClassifyAuditFailures / -ReclassifyFailureDomains / -BuildRepairQueue"
+    Write-Host "before deciding whether an item belongs in ReplacementReview."
+    Write-Host "Persistent repair state was NOT modified."
+    return
+}
 
 $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Extension.ToLowerInvariant() -in $AudioExtensions })
@@ -1290,7 +5127,6 @@ else {
 }
 
 $tracks | Export-Csv -LiteralPath $TrackReport -NoTypeInformation -Encoding UTF8
-$DecodeReport = Join-Path $StateRoot "source-decode-audit.csv"
 $tracks |
     Select-Object Path,Directory,FileName,SourceDecodeStatus,SourceDecodeExitCode,SourceDecodeError |
     Export-Csv -LiteralPath $DecodeReport -NoTypeInformation -Encoding UTF8
@@ -1389,7 +5225,78 @@ foreach ($g in $groups) {
 $albums | Export-Csv -LiteralPath $AlbumReport -NoTypeInformation -Encoding UTF8
 $plans | Export-Csv -LiteralPath $PlanReport -NoTypeInformation -Encoding UTF8
 
-$state = @{ version=$ToolVersion; root=$Root; reviewed=@{}; plans=@{}; applied=@{}; generatedAt=(Get-Date).ToString("o") }
+if ($AuditOnly) {
+    $auditReplacementRows = @(
+        $tracks |
+        Where-Object { $_.SourceDecodeStatus -eq "SOURCE DECODE ERROR" } |
+        ForEach-Object {
+            [pscustomobject]@{
+                Status                = "ObservedDecodeFailure"
+                ObservationOnly       = $true
+                ReplacementAuthorized = $false
+                SourcePath            = $_.Path
+                AlbumDirectory  = $_.Directory
+                Artist          = $_.Artist
+                Album           = $_.Album
+                Date            = $_.Date
+                Disc            = $_.Disc
+                Track           = $_.Track
+                Title           = $_.Title
+                FileName        = $_.FileName
+                DecodeExitCode  = $_.SourceDecodeExitCode
+                DecodeError     = $_.SourceDecodeError
+            }
+        }
+    )
+
+    $auditReplacementRows |
+        Sort-Object AlbumDirectory, Disc, Track, FileName |
+        Export-Csv -LiteralPath $ReplacementReport -NoTypeInformation -Encoding UTF8
+
+    $readyCount = @($albums | Where-Object { $_.Status -eq "READY" }).Count
+    $reviewCount = @($albums | Where-Object { $_.Status -eq "NEEDS REVIEW" }).Count
+    $incompleteCount = @($albums | Where-Object { $_.Status -eq "INCOMPLETE" }).Count
+    $sourceErrorCount = @($albums | Where-Object { $_.Status -eq "SOURCE ERROR" }).Count
+    $probeErrorTrackCount = @($tracks | Where-Object { $_.ProbeError }).Count
+    $suspiciousTitleCount = @($tracks | Where-Object { $_.SuspiciousTitle }).Count
+    $missingEmbeddedCount = @($tracks | Where-Object { -not $_.EmbeddedCover }).Count
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " AUDIT COMPLETE"
+    Write-Host ("=" * 72)
+    Write-Host "Audio files          : $($tracks.Count)"
+    Write-Host "Album folders        : $($albums.Count)"
+    Write-Host "READY                : $readyCount"
+    Write-Host "NEEDS REVIEW         : $reviewCount"
+    Write-Host "INCOMPLETE           : $incompleteCount"
+    Write-Host "SOURCE ERROR         : $sourceErrorCount"
+    Write-Host "ffprobe error tracks : $probeErrorTrackCount"
+    if ($SkipSourceDecodeAudit) {
+        Write-Host "Source decode errors : NOT CHECKED"
+    }
+    else {
+        Write-Host "Source decode errors : $sourceDecodeFailures"
+    }
+    Write-Host "Suspicious titles    : $suspiciousTitleCount"
+    Write-Host "Missing embedded art : $missingEmbeddedCount"
+
+    $classification = Export-AuditFailureClassification -Tracks $tracks -OutputRoot $ReportRoot
+    Show-AuditFailureClassification -Classification $classification
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $TrackReport"
+    Write-Host "  $AlbumReport"
+    Write-Host "  $PlanReport"
+    Write-Host "  $DecodeReport"
+    Write-Host "  $ReplacementReport"
+    Write-Host ""
+    Write-Host "Persistent repair state was NOT modified."
+    return
+}
+
+$state = @{ version=$ToolVersion; root=$Root; reviewed=@{}; plans=@{}; applied=@{}; replacements=@{}; generatedAt=(Get-Date).ToString("o") }
 
 # Apply mode must always load the saved review/plan state.
 # -Resume remains useful for returning to an interrupted interactive review.
@@ -1400,12 +5307,28 @@ if ($shouldLoadState -and (Test-Path -LiteralPath $StateFile)) {
         if ($old.root -eq $Root -and $old.reviewed) { $state.reviewed = $old.reviewed }
         if ($old.root -eq $Root -and $old.plans) { $state.plans = $old.plans }
         if ($old.root -eq $Root -and $old.ContainsKey("applied") -and $old.applied) { $state.applied = $old.applied }
+        if ($old.root -eq $Root -and $old.ContainsKey("replacements") -and $old.replacements) { $state.replacements = $old.replacements }
     } catch {
         Write-Warning "Could not load previous state."
     }
 }
 
+Sync-ReplacementQueue -Tracks $tracks -State $state
+Export-ReplacementQueue -State $state -Path $ReplacementReport
+$state.generatedAt=(Get-Date).ToString("o")
+$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StateFile -Encoding UTF8
+
+$decodeObservationCount = @(
+    $state.replacements.Values |
+    Where-Object { $_.Status -in @("Needed","ObservedDecodeFailure") }
+).Count
+
 if ($ApplyApproved) {
+    if (-not $SkipSourceDecodeAudit -and $decodeObservationCount -gt 0) {
+        Write-Host "Decode observations  : $decodeObservationCount observed"
+        Write-Host "Observation report   : $ReplacementReport"
+        Write-Host ""
+    }
     Invoke-ApprovedApply -BackupOriginals:$BackupOriginals -Yes:$Yes
     return
 }
@@ -1417,6 +5340,10 @@ Write-Host "  $TrackReport"
 Write-Host "  $AlbumReport"
 Write-Host "  $PlanReport"
 Write-Host "  $DecodeReport"
+Write-Host "  $ReplacementReport"
+if (-not $SkipSourceDecodeAudit) {
+    Write-Host "Decode observations  : $decodeObservationCount observed"
+}
 Write-Host ""
 
 for ($a=0; $a -lt $albums.Count; $a++) {
@@ -1559,14 +5486,14 @@ for ($a=0; $a -lt $albums.Count; $a++) {
         if ($choice -eq "N") { break }
         if ($choice -eq "Q") {
             $state.generatedAt=(Get-Date).ToString("o")
-            $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $StateFile -Encoding UTF8
+            $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StateFile -Encoding UTF8
             Write-Host "State saved: $StateFile"
             return
         }
     }
 
     $state.generatedAt=(Get-Date).ToString("o")
-    $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $StateFile -Encoding UTF8
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StateFile -Encoding UTF8
 }
 
 Write-Host ""

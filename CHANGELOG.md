@@ -6,9 +6,135 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 
 ## [Unreleased]
 
+### Fixed
+- Script comment-based help now appears before `#requires`, allowing `Get-Help -Full` to render the authored synopsis/description/examples instead of syntax-only fallback; the RC harness now tests this explicitly
+- Raw strict-decoder failures are now persisted/exported as `ObservedDecodeFailure` evidence rather than automatic `Needed` replacement entries
+- The old `replacement-needed.csv` output is replaced by `source-decode-observations.csv`, which explicitly records `ObservationOnly=True` and `ReplacementAuthorized=False`
+- RC regression coverage now includes missing staged files, changed staged hashes, and pre-existing cross-extension targets
+- Same-extension transactional replacement now supplies a real same-directory swap-backup path to `System.IO.File.Replace`, fixing Windows/.NET rejection of a null backup path; the temporary swap backup is removed after verification
+- RC harness now checks `SourceDecodeStatus` from `source-decode-audit.csv` instead of the nonexistent `Status` field
+- RC harness FFmpeg sine-source interpolation now uses `${Frequency}` so PowerShell does not parse `:duration` as part of the variable name
+- Add conservative `.mp3` forced-demuxer fallback when normal ffprobe detection fails
+- Preserve normal probe failure separately from forced probe/decode evidence
+- Classify successful fallback candidates as `CandidateForcedDemuxerReview` rather than generic probe failure or normal validation
+- Record `ForcedDemuxer`, `ForcedProbeStatus`, `ForcedDecodeStatus`, and `NormalProbeError` in candidate validation output
+- Refine dev.10 evidence labels so a missing path is `MissingSourcePath`, while an existing file that has no probe duration and no measurable tolerant decode is `UnreadableMediaSource`
+- `-ReclassifyFailureDomains` now bypasses normal ffprobe/ffmpeg preflight checks because it only reads existing CSV measurements
+- Fixes silent pre-banner exit when running the report-only reclassification mode
+- Preserve combined error evidence instead of letting `AUDIO` override simultaneous `CONTAINER` or `ARTWORK` evidence
+- Combined domains now surface explicitly (`AUDIO+CONTAINER`, `AUDIO+ARTWORK`, `ARTWORK+CONTAINER`, or all three)
+- Combined-domain dispositions default conservatively to `ManualReview`
+- Wrapped mutually exclusive mode selection in an explicit array. Under strict mode, a single selected switch could collapse to a scalar Boolean and `.Count` raised before the startup banner.
+- Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
+
+### Added
+- `v0.7-rc.2` documentation and architecture hardening pass
+- built-in PowerShell `Get-Help` documentation for the main script
+- user documentation for usage, reports, architecture, recovery, troubleshooting, and v0.7 release notes
+- `v0.7-rc.1` release-candidate hardening baseline
+- `scripts/Test-ReleaseCandidate.ps1` isolated synthetic regression harness
+- RC coverage for parser/version consistency, safe audit, strict decode reporting, downgrade refusal, same-extension replacement, cross-extension replacement, verified backups, post-verification, queue clearance, and album requalification
+- `docs/RELEASE-CHECKLIST.md` stable-promotion checklist
+- `-VerifyReplacementTransactions` read-only post-replacement verification mode
+- Automatic targeted post-verification after successful replacement commits
+- Current-state verification of source disposition, replacement existence, retained backup, SHA-256 hashes, and strict decode
+- Forced-demuxer-aware verification for replacements that require extension-specific probing/decoding
+- Affected-album rescan and requalification to `READY`, `NEEDS REVIEW`, `INCOMPLETE`, or `SOURCE ERROR`
+- `QueueStatus=ClearedByCurrentState` when the repaired item no longer requires source-error attention
+- `replacement-postverify.csv` and `replacement-postverify-summary.csv`
+- Dev.14.1 conservative source/replacement quality-class comparison
+- Explicit `QualityDowngradeApproved` intake gate for known lossless-to-lossy replacements
+- `QualityDowngrade`, `SameQualityClass`, `LosslessClassCandidate`, and `Unknown` relationship reporting
+- Conservative extension classification: FLAC/WAV/AIFF/APE as lossless; MP3/AAC/Opus as lossy; ambiguous containers remain `Unknown`
+- Transaction manifest fields for source class, replacement class, relationship, and downgrade approval
+- `-ApplyStagedReplacements` transactional replacement mode
+- Explicit triple gate: `ReplaceApproved=Yes`, `-BackupOriginals`, and `-Yes`
+- Verified backup copy before any source mutation
+- SHA-256 revalidation of the staged candidate immediately before replacement
+- Same-extension commit via `System.IO.File.Replace`
+- Cross-extension commit that publishes the verified replacement first and removes the damaged source only after final verification
+- Post-commit SHA-256 and strict-decode verification
+- Automatic best-effort rollback from the verified backup on transaction failure
+- Retained replacement backups plus transaction manifest/summary reports
+- `-StageReplacementCandidates` explicit non-destructive staging mode
+- `StageApproved` intake field; only explicitly approved candidates are considered
+- Stage eligibility limited to `CandidateValidatedForReview` and `CandidateForcedDemuxerReview`
+- Stable per-source staging directories under the repair workspace
+- SHA-256 verification of candidate, temporary copy, and finalized staged copy
+- Strict decode verification of the staged copy, including preserved forced-demuxer validation when required
+- `replacement-staging-manifest.csv` and `replacement-staging-summary.csv`
+- `StagedVerified` remains non-authorizing; original library media and persistent repair state remain untouched
+- Dev.12 expected-identity reconstruction for replacement candidates when damaged source tags are missing
+- Provenance-aware identity fields using `SourceTag`, `FileName`, `ParentFolder`, and `GrandparentFolder`
+- Conservative parsing for common track/title, canonical single-disc, and canonical multi-disc filenames
+- Album/year inference from the containing album folder and artist inference from the surrounding directory layout
+- Candidate validation report fields for expected identity provenance and combined `IdentityBasis`
+- `-ReviewReplacementCandidates` non-destructive candidate-intake and validation mode
+- `replacement-candidate-intake.csv` for assigning local candidate paths to high-confidence `UnreadableMediaSource` items
+- Candidate intake preserves assigned paths and review notes across reruns
+- `replacement-candidate-validation.csv` with ffprobe, strict-decode, duration, identity score, identity conflicts, and expected-vs-candidate metadata
+- `replacement-candidate-summary.csv` with candidate and strict-decode status counts
+- Conservative candidate states including missing, unsupported, probe-failed, strict-decode-failed, duration-unavailable, identity-conflict, identity-review, and validated-for-review
+- `CandidateValidatedForReview` explicitly remains non-authorizing: no staging, swap, source modification, or persistent repair-state update occurs in dev.11
+- `-AnalyzeReplacementEvidence` targeted diagnostic mode for the dev.9 `NeedsMoreEvidence` subset
+- Fresh ffprobe duration retrieval and tolerant audio decoding only for unresolved replacement-review items
+- `replacement-evidence-analysis.csv` with evidence resolution, replacement confidence, probe status, targeted decode status, original/targeted signatures, durations, completion percentage, and identity context
+- `replacement-evidence-summary.csv` grouped by evidence resolution, confidence, probe/decode status, signatures, and extension
+- Evidence resolutions for confirmed severe loss, container/header failure, unavailable probe duration, successful decode with unknown duration, unreadable source, and manual inspection
+- Explicit rule that even high replacement confidence remains review-only and never authorizes replacement
+- `-AnalyzeReplacementReview` report-only mode for the `ReplacementReview` subset
+- `replacement-review-analysis.csv` with review priority, evidence assessment, completion band, signature, format, and track identity context
+- `replacement-review-summary.csv` grouped by priority, evidence assessment, completion band, severity, signature, and extension
+- Conservative review buckets that distinguish missing/very-low-completion files, substantial decoded loss, near-complete damaged files, and complete-or-nearly-complete severe diagnostics
+- Replacement-review analysis reuses the existing repair queue and does not decode media or modify persistent state
+- `-BuildRepairQueue` report-only mode
+- `repair-action-queue.csv` generated from the newest available reclassified/full failure classification
+- `repair-action-queue-summary.csv` grouped by action, queue status, primary domain, and severity
+- Audit `tracks.csv` metadata enrichment for repair-queue rows when available
+- Queue statuses for audio review, container review, artwork repair, replacement review, missing-file lookup, and manual review
+- Explicit guarantee that `ReplacementReview` is non-destructive review state and does not authorize replacement
+- `-ReclassifyFailureDomains` mode that reuses existing full-classification measurements without re-decoding audio
+- Separate `PrimaryDomain` and `EvidenceDomain` fields
+- Primary domain is derived from the canonical signature and drives disposition
+- Evidence domain preserves every domain observed in FFmpeg diagnostics
+- `failure-classification-reclassified.csv` and summary report
+- `-ClassifyAuditFailures` full-library failure classification mode
+- Classifies every row from `audio-only-recheck.csv` using the validated canonical signature, error-domain, audio-completion, severity, and disposition model
+- `failure-classification.csv` with per-file results
+- `failure-classification-summary.csv` with counts by action, domain, severity, and canonical signature
+- Full classification remains read-only and does not change media or persistent repair state
+- Canonical FFmpeg error signatures that remove volatile decoder addresses
+- Independent error domains: `AUDIO`, `ARTWORK`, `CONTAINER`, `MIXED`, `UNKNOWN`
+- Domain-aware failure dispositions: `RepairArtwork`, `ContainerReview`, `AudioReview`, `ManualReview`, `ReplacementReview`
+- Severity now combines audio completion with error domain instead of treating all FFmpeg stderr equally
+- `-AnalyzeFailureSeverity` diagnostic mode
+- Configurable `-FailureSamplesPerSignature` sampling (default 5), spread across albums where possible
+- Tolerant audio decode diagnostics comparing decoded progress with ffprobe-reported duration
+- Diagnostic severity buckets: `DegradedButComplete`, `MostlyDecodable`, `DecodableWithErrors`, `Severe`, and `MissingFile`
+- `failure-severity-samples.csv`
+- `-RecheckAuditFailures` mode to retest only previously failed files instead of re-decoding the entire library
+- `audio-only-recheck.csv` report
+- Strict audio decode now disables video, subtitle, and data streams at both input and output so malformed attached artwork cannot be misclassified as source-audio corruption
+- `-AnalyzeAuditReports` mode to classify an existing whole-library audit without re-decoding media
+- Decode failures grouped by audio extension
+- Normalized decoder-error signature report
+- Per-album failure concentration classification: isolated, partial, mostly-album, or whole-album
+- ffprobe vs strict-decode cross-check report
+- Classification is also generated automatically at the end of future `-AuditOnly` runs
+- Real `-AuditOnly` mode for non-interactive, read-only library-wide auditing
+- Audit reports isolated under `Music-Library-Repair\audit` so an audit cannot overwrite an in-progress repair `state.json`
+- Audit summary counts for album status, probe errors, strict decode failures, suspicious titles, and missing embedded artwork
+- Persistent source-replacement queue stored in `state.json`
+- `replacement-needed.csv` export for strict source decode failures
+- First/last detection timestamps for replacement items
+- Queue history is preserved when a previously failing path no longer fails
+- Existing future replacement fields are preserved across rescans
+
 ### Planned
-- Replacement queue for known-bad source audio
+- Verified replacement candidate selection and strict candidate decode
+- Duration/identity validation before staging
 - Verified replacement staging and transactional swap
+- Album re-audit after replacement
 - Missing-track / track-gap detection
 - MusicBrainz media breakdown instead of raw aggregate track count
 - Better title verification against authoritative tracklists

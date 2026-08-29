@@ -2,19 +2,134 @@
 
 ## v0.7 target — Source Replacement
 
-Priority:
+Implemented in `v0.7-dev.1`:
 
 - export `replacement-needed.csv`
-- persistent replacement status in state
-- interactive replacement-candidate selection
-- strict candidate decode
-- duration/identity checks
+- persistent replacement items/status in state
+- first/last detection timestamps
+- queue history preservation across rescans
+
+Implemented in `v0.7-dev.8`:
+
+- report-only `-BuildRepairQueue`
+- actionable `repair-action-queue.csv`
+- `repair-action-queue-summary.csv`
+- queue grouping by disposition, status, primary domain, and severity
+- metadata enrichment from the existing audit track report
+- explicit non-destructive `ReplacementReview` state
+
+Implemented in `v0.7-dev.9`:
+
+- report-only `-AnalyzeReplacementReview`
+- replacement-review evidence/completion breakdown
+- priority bands for severe review items
+- signature/format/album identity context before candidate sourcing
+
+Implemented in `v0.7-dev.10`:
+
+- targeted `-AnalyzeReplacementEvidence` pass for `NeedsMoreEvidence`
+- fresh ffprobe duration evidence only for unresolved review items
+- tolerant diagnostic decode only for unresolved review items
+- evidence-resolution and confidence reports before candidate sourcing
+- dev.10.1 distinguishes missing paths from present-but-unreadable media sources
+
+Implemented in `v0.7-dev.11`:
+
+- non-destructive `-ReviewReplacementCandidates`
+- persistent CSV intake for local candidate paths
+- ffprobe readability validation
+- strict candidate decode validation
+- candidate duration readability check
+- conservative expected-vs-candidate identity scoring and conflict detection
+- validated-for-review status without staging or replacement authority
+- dev.11.1 conservative forced-MP3 demuxer fallback with explicit review-only status when automatic probing misdetects a candidate
+
+Implemented in `v0.7-dev.12`:
+
+- expected-identity reconstruction when source tags are missing
+- provenance for inferred identity fields
+- filename-based track/title/artist/disc recovery
+- parent-folder album/year inference
+- grandparent-folder artist inference
+- candidate comparison against reconstructed identity without granting replacement authority
+
+Implemented in `v0.7-dev.13`:
+
+- explicit per-candidate `StageApproved` gate
+- non-destructive workspace staging
+- SHA-256 copy verification
+- strict decode verification of staged media
+- forced-demuxer preservation during staged verification
+- staging manifest and summary reports
+- no original-library or persistent-state mutation
+
+Implemented in `v0.7-dev.14`:
+
+- explicit replacement approval gate
+- verified pre-commit backup
+- transactional same-extension replacement
+- safe cross-extension replacement publication
+- post-commit hash and strict-decode verification
+- automatic best-effort rollback on failure
+- retained backup and transaction reports
+
+Implemented in `v0.7-dev.14.1`:
+
+- conservative media quality-class comparison
+- explicit lossless-to-lossy downgrade approval gate
+- ambiguous containers remain Unknown rather than guessed
+- quality relationship fields in transaction reporting
+
+Implemented in `v0.7-dev.15`:
+
+- read-only post-replacement transaction verification
+- automatic verification after successful replacement commits
+- current-state source/replacement/backup hash checks
+- forced-demuxer-aware strict decode verification
+- affected-album re-audit and status requalification
+- targeted queue-cleared assessment without rewriting historical audit reports
+
+Implemented in `v0.7-rc.1`:
+
+- isolated synthetic release-candidate regression harness
+- parser and version consistency gates
+- safe AuditOnly regression exercise
+- downgrade refusal regression
+- same- and cross-extension transactional replacement regression
+- verified backup and post-verification regression
+- release checklist for promotion to v0.7 stable
+- rc.1.1 fixes PowerShell interpolation in synthetic FFmpeg sine fixtures
+- rc.1.2 fixes the synthetic decode-report assertion field
+- rc.1.3 fixes same-extension File.Replace backup-path handling and verifies swap-backup cleanup
+
+Next:
+
+- exercise dev.11 candidate intake against known clean local replacement files
+- improve authoritative duration/identity verification where source duration is unavailable
+- interactive/assisted candidate discovery
 - transactional replacement
 - album re-audit after replacement
 - preserve unresolved items across runs
 
 ## Near-term
 
+- [x] non-interactive `-AuditOnly` whole-library reporting mode
+- [x] classify strict-decode failures by extension and error signature
+- [x] classify failure concentration by album
+- [x] ffprobe/strict-decode cross-check reporting
+- [x] analyze existing audit reports without re-decoding media
+- [x] isolate strict source-audio decode from attached artwork/non-audio streams
+- [x] targeted recheck of previous audit failures
+- [x] sampled failure-severity diagnostics before replacement decisions
+- [x] canonicalize volatile FFmpeg decoder signatures
+- [x] separate audio, artwork, container, mixed, and unknown error domains
+- [x] domain-aware severity/disposition model
+- [x] preserve combined error-domain evidence without precedence loss
+- [x] classify all known strict-audit failures with the validated disposition model
+- [x] separate primary failure domain from secondary evidence domains
+- [x] reclassify existing full-audit measurements without repeat decoding
+- [x] make report-only reclassification independent of ffmpeg/ffprobe preflight
+- [x] build a report-only actionable repair queue from validated classification
 - missing-track / track-number gap detector
 - disc-aware gap detection
 - authoritative MusicBrainz tracklist comparison
@@ -76,3 +191,17 @@ v1.0 should not be tagged until:
 - state migration is defined
 - destructive edge cases are covered by tests
 - documentation matches actual behavior
+
+
+## v0.7-rc.2 stable hardening
+
+Implemented:
+
+- raw decoder observations separated from replacement authorization
+- built-in PowerShell help
+- stable user documentation suite
+- edge-case RC tests for missing stage, changed staged hash, and existing target
+- playlist rewriting explicitly deferred rather than left ambiguous
+- v0.7 release notes
+
+- rc.2.1 fixes comment-based help placement and adds Get-Help regression assertions
