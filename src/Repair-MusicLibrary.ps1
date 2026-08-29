@@ -167,7 +167,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-rc.2.1"
+$ToolVersion = "0.7"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -5499,3 +5499,4 @@ for ($a=0; $a -lt $albums.Count; $a++) {
 Write-Host ""
 Write-Host "Review complete."
 Write-Host "State: $StateFile"
+
