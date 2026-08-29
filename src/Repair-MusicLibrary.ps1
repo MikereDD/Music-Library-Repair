@@ -19,6 +19,7 @@ param(
     [switch]$AnalyzeReplacementReview,
     [switch]$AnalyzeReplacementEvidence,
     [switch]$ReviewReplacementCandidates,
+    [switch]$StageReplacementCandidates,
     [ValidateRange(1,50)]
     [int]$FailureSamplesPerSignature = 5
 )
@@ -26,7 +27,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.12"
+$ToolVersion = "0.7-dev.13"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -1060,6 +1061,7 @@ function Invoke-ReviewReplacementCandidates {
             Title          = $row.Title
             Extension      = $row.Extension
             CandidatePath  = if ($existing) { $existing.CandidatePath } else { $null }
+            StageApproved  = if ($existing -and $existing.PSObject.Properties["StageApproved"]) { $existing.StageApproved } else { "No" }
             ReviewNotes    = if ($existing) { $existing.ReviewNotes } else { $null }
         })
     }
@@ -1468,6 +1470,239 @@ function Invoke-ReviewReplacementCandidates {
     Write-Host "No candidate media files were modified."
     Write-Host "Persistent repair state was NOT modified."
     Write-Host "CandidateValidatedForReview means structurally clean and identity-plausible; it does NOT authorize staging or replacement.`nCandidateForcedDemuxerReview means normal probing failed but an extension-specific forced demuxer passed probe/decode; it always requires review."
+}
+
+
+function Test-TruthyStageApproval {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return @("1","true","yes","y","stage","approved") -contains $Value.Trim().ToLowerInvariant()
+}
+
+function Get-StagingSourceKey {
+    param([Parameter(Mandatory)][string]$SourcePath)
+
+    $bytes = [Text.Encoding]::UTF8.GetBytes($SourcePath.ToLowerInvariant())
+    $hash = [Security.Cryptography.SHA256]::HashData($bytes)
+    return ([Convert]::ToHexString($hash)).Substring(0,16).ToLowerInvariant()
+}
+
+function Invoke-StageReplacementCandidates {
+    param(
+        [Parameter(Mandatory)][string]$CandidateIntakePath,
+        [Parameter(Mandatory)][string]$CandidateValidationPath,
+        [Parameter(Mandatory)][string]$StagingRoot,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $CandidateIntakePath -PathType Leaf)) {
+        throw "Candidate intake not found: $CandidateIntakePath`nRun -ReviewReplacementCandidates first."
+    }
+    if (-not (Test-Path -LiteralPath $CandidateValidationPath -PathType Leaf)) {
+        throw "Candidate validation not found: $CandidateValidationPath`nRun -ReviewReplacementCandidates first."
+    }
+
+    $intake = @(Import-Csv -LiteralPath $CandidateIntakePath)
+    $validations = @(Import-Csv -LiteralPath $CandidateValidationPath)
+
+    $validationBySource = @{}
+    foreach ($v in $validations) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$v.SourcePath)) {
+            $validationBySource[[string]$v.SourcePath] = $v
+        }
+    }
+
+    $approved = @(
+        $intake | Where-Object {
+            Test-TruthyStageApproval ([string]$_.StageApproved)
+        }
+    )
+
+    $manifestPath = Join-Path $OutputRoot "replacement-staging-manifest.csv"
+    $summaryPath = Join-Path $OutputRoot "replacement-staging-summary.csv"
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    if (-not (Test-Path -LiteralPath $StagingRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $StagingRoot -Force | Out-Null
+    }
+
+    foreach ($item in $approved) {
+        $sourcePath = [string]$item.SourcePath
+        $candidatePath = [Environment]::ExpandEnvironmentVariables([string]$item.CandidatePath)
+        $candidatePath = $candidatePath.Trim()
+
+        $status = "NotStaged"
+        $reason = $null
+        $validationStatus = $null
+        $candidateHash = $null
+        $stagedHash = $null
+        $stagedPath = $null
+        $copyVerified = $false
+        $stagedDecodeStatus = "NotRun"
+        $forcedDemuxer = $null
+
+        if (-not $validationBySource.ContainsKey($sourcePath)) {
+            $status = "Blocked"
+            $reason = "NoCandidateValidation"
+        }
+        else {
+            $validation = $validationBySource[$sourcePath]
+            $validationStatus = [string]$validation.CandidateStatus
+            $forcedDemuxer = [string]$validation.ForcedDemuxer
+
+            if ($validationStatus -notin @("CandidateValidatedForReview","CandidateForcedDemuxerReview")) {
+                $status = "Blocked"
+                $reason = "CandidateStatusNotStageEligible"
+            }
+            elseif ([string]::IsNullOrWhiteSpace($candidatePath) -or -not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                $status = "Blocked"
+                $reason = "CandidateMissing"
+            }
+            else {
+                $candidateFile = Get-Item -LiteralPath $candidatePath
+                $sourceKey = Get-StagingSourceKey -SourcePath $sourcePath
+                $stageDir = Join-Path $StagingRoot $sourceKey
+                if (-not (Test-Path -LiteralPath $stageDir -PathType Container)) {
+                    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+                }
+
+                $stagedPath = Join-Path $stageDir $candidateFile.Name
+                $tempPath = "$stagedPath.partial"
+
+                if (Test-Path -LiteralPath $tempPath) {
+                    Remove-Item -LiteralPath $tempPath -Force
+                }
+
+                $candidateHash = (Get-FileHash -LiteralPath $candidateFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+                Copy-Item -LiteralPath $candidateFile.FullName -Destination $tempPath -Force
+
+                $tempHash = (Get-FileHash -LiteralPath $tempPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($candidateHash -ne $tempHash) {
+                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                    $status = "Blocked"
+                    $reason = "StageCopyHashMismatch"
+                }
+                else {
+                    Move-Item -LiteralPath $tempPath -Destination $stagedPath -Force
+                    $stagedHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                    $copyVerified = ($candidateHash -eq $stagedHash)
+
+                    if (-not $copyVerified) {
+                        $status = "Blocked"
+                        $reason = "FinalStageHashMismatch"
+                    }
+                    else {
+                        $stagedFile = Get-Item -LiteralPath $stagedPath
+                        if ($validationStatus -eq "CandidateForcedDemuxerReview") {
+                            if ([string]::IsNullOrWhiteSpace($forcedDemuxer)) {
+                                $status = "Blocked"
+                                $reason = "ForcedDemuxerMissingFromValidation"
+                            }
+                            else {
+                                $decode = Test-CandidateAudioDecodeForced -File $stagedFile -Demuxer $forcedDemuxer
+                                if ($decode.Clean) {
+                                    $stagedDecodeStatus = "PassForced"
+                                    $status = "StagedVerified"
+                                }
+                                else {
+                                    $stagedDecodeStatus = "FailedForced"
+                                    $status = "Blocked"
+                                    $reason = "StagedStrictDecodeFailed"
+                                }
+                            }
+                        }
+                        else {
+                            $decode = Test-SourceAudioDecode -File $stagedFile
+                            if ($decode.Clean) {
+                                $stagedDecodeStatus = "Pass"
+                                $status = "StagedVerified"
+                            }
+                            else {
+                                $stagedDecodeStatus = "Failed"
+                                $status = "Blocked"
+                                $reason = "StagedStrictDecodeFailed"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        $rows.Add([pscustomobject]@{
+            StageStatus         = $status
+            BlockReason         = $reason
+            SourcePath          = $sourcePath
+            CandidatePath       = $candidatePath
+            CandidateStatus     = $validationStatus
+            ForcedDemuxer       = $forcedDemuxer
+            StagedPath          = $stagedPath
+            CandidateSHA256     = $candidateHash
+            StagedSHA256        = $stagedHash
+            CopyHashVerified    = $copyVerified
+            StagedDecodeStatus  = $stagedDecodeStatus
+            StagedAt            = (Get-Date).ToString("o")
+        })
+    }
+
+    $rows |
+        Sort-Object StageStatus, SourcePath |
+        Export-Csv -LiteralPath $manifestPath -NoTypeInformation -Encoding UTF8
+
+    $summary = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in ($rows | Group-Object StageStatus | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "StageStatus"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+    foreach ($group in ($rows | Group-Object BlockReason | Where-Object { $_.Name } | Sort-Object Count -Descending)) {
+        $summary.Add([pscustomobject]@{
+            Category = "BlockReason"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summary |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " REPLACEMENT CANDIDATE STAGING"
+    Write-Host ("=" * 72)
+    Write-Host "Approved for staging : $($approved.Count)"
+
+    Write-Host ""
+    Write-Host "Stage status:"
+    if ($rows.Count -eq 0) {
+        Write-Host "  Nothing approved for staging."
+    }
+    else {
+        foreach ($group in ($rows | Group-Object StageStatus | Sort-Object Count -Descending)) {
+            Write-Host ("  {0,-28} {1,6}" -f $group.Name,$group.Count)
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Files:"
+    Write-Host "  Manifest : $manifestPath"
+    Write-Host "  Summary  : $summaryPath"
+    Write-Host "  Staging  : $StagingRoot"
+
+    if ($approved.Count -eq 0) {
+        Write-Host ""
+        Write-Host "Set StageApproved to Yes for a reviewed candidate in replacement-candidate-intake.csv, then rerun."
+    }
+
+    Write-Host ""
+    Write-Host "Staging copies candidate media only into the repair workspace."
+    Write-Host "Original library media was NOT modified."
+    Write-Host "Candidate source files were NOT modified."
+    Write-Host "Persistent repair state was NOT modified."
+    Write-Host "StagedVerified means the copy hash matches and the staged copy passed strict decode; it does NOT authorize replacement."
 }
 
 
@@ -3705,19 +3940,20 @@ $exclusiveModes = @(
         [bool]$AnalyzeReplacementReview,
         [bool]$AnalyzeReplacementEvidence,
         [bool]$ReviewReplacementCandidates,
+        [bool]$StageReplacementCandidates,
         [bool]$ApplyApproved
     ) | Where-Object { $_ }
 )
 
 if ($exclusiveModes.Count -gt 1) {
-    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, -ReviewReplacementCandidates, and -ApplyApproved are mutually exclusive modes."
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, -BuildRepairQueue, -AnalyzeReplacementReview, -AnalyzeReplacementEvidence, -ReviewReplacementCandidates, -StageReplacementCandidates, and -ApplyApproved are mutually exclusive modes."
 }
 
 if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not $BuildRepairQueue -and -not $AnalyzeReplacementReview -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
-if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     throw "ffmpeg was not found in PATH."
 }
 if (($AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
@@ -3728,7 +3964,7 @@ New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
 # Audit/report-analysis output is intentionally isolated from persistent repair
 # state so whole-library analysis cannot overwrite an in-progress review.
-$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates) { Join-Path $StateRoot "audit" } else { $StateRoot }
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains -or $BuildRepairQueue -or $AnalyzeReplacementReview -or $AnalyzeReplacementEvidence -or $ReviewReplacementCandidates -or $StageReplacementCandidates) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -3743,12 +3979,18 @@ $FailureReclassifiedReport = Join-Path $ReportRoot "failure-classification-recla
 $RepairActionQueueReport = Join-Path $ReportRoot "repair-action-queue.csv"
 $ReplacementReviewAnalysisReport = Join-Path $ReportRoot "replacement-review-analysis.csv"
 $ReplacementEvidenceAnalysisReport = Join-Path $ReportRoot "replacement-evidence-analysis.csv"
+$ReplacementCandidateIntakeReport = Join-Path $ReportRoot "replacement-candidate-intake.csv"
+$ReplacementCandidateValidationReport = Join-Path $ReportRoot "replacement-candidate-validation.csv"
+$ReplacementStagingRoot = Join-Path $StateRoot "staging"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($StageReplacementCandidates) {
+    "STAGE REPLACEMENT CANDIDATES"
 }
 elseif ($ReviewReplacementCandidates) {
     "REVIEW REPLACEMENT CANDIDATES"
@@ -3785,6 +4027,15 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($StageReplacementCandidates) {
+    Invoke-StageReplacementCandidates `
+        -CandidateIntakePath $ReplacementCandidateIntakeReport `
+        -CandidateValidationPath $ReplacementCandidateValidationReport `
+        -StagingRoot $ReplacementStagingRoot `
+        -OutputRoot $ReportRoot
+    return
+}
 
 if ($ReviewReplacementCandidates) {
     Invoke-ReviewReplacementCandidates `

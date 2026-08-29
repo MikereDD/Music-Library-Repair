@@ -53,6 +53,16 @@ Implemented in `v0.7-dev.12`:
 - grandparent-folder artist inference
 - candidate comparison against reconstructed identity without granting replacement authority
 
+Implemented in `v0.7-dev.13`:
+
+- explicit per-candidate `StageApproved` gate
+- non-destructive workspace staging
+- SHA-256 copy verification
+- strict decode verification of staged media
+- forced-demuxer preservation during staged verification
+- staging manifest and summary reports
+- no original-library or persistent-state mutation
+
 Next:
 
 - exercise dev.11 candidate intake against known clean local replacement files

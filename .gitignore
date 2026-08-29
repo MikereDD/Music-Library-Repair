@@ -30,6 +30,9 @@ replacement-evidence-summary.csv
 replacement-candidate-intake.csv
 replacement-candidate-validation.csv
 replacement-candidate-summary.csv
+replacement-staging-manifest.csv
+replacement-staging-summary.csv
+staging/
 *-audit.csv
 cover-cache/
 Backups/

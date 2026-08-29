@@ -21,6 +21,14 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `-StageReplacementCandidates` explicit non-destructive staging mode
+- `StageApproved` intake field; only explicitly approved candidates are considered
+- Stage eligibility limited to `CandidateValidatedForReview` and `CandidateForcedDemuxerReview`
+- Stable per-source staging directories under the repair workspace
+- SHA-256 verification of candidate, temporary copy, and finalized staged copy
+- Strict decode verification of the staged copy, including preserved forced-demuxer validation when required
+- `replacement-staging-manifest.csv` and `replacement-staging-summary.csv`
+- `StagedVerified` remains non-authorizing; original library media and persistent repair state remain untouched
 - Dev.12 expected-identity reconstruction for replacement candidates when damaged source tags are missing
 - Provenance-aware identity fields using `SourceTag`, `FileName`, `ParentFolder`, and `GrandparentFolder`
 - Conservative parsing for common track/title, canonical single-disc, and canonical multi-disc filenames

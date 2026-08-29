@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.12-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.13-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.12**
+> Current development baseline: **v0.7-dev.13**
 
 ## Core workflow
 
@@ -237,6 +237,16 @@ Candidate validation checks that the file exists, is a supported audio format, i
 If normal probing fails for a `.mp3`, dev.11.1 performs a conservative MP3-demuxer fallback. A candidate that passes forced MP3 probe and forced strict decode is labeled `CandidateForcedDemuxerReview`, never silently promoted to normal validation. The report preserves the normal-probe failure and the forced-probe/decode evidence.
 
 Dev.12 reconstructs expected identity when damaged source tags are missing. It prefers source tags, then cautiously derives track/title/artist/disc from recognized filename patterns and album/artist/year from the directory layout. Validation reports record the provenance for each expected field (`SourceTag`, `FileName`, `ParentFolder`, or `GrandparentFolder`) so inferred identity is never presented as authoritative metadata.
+
+Dev.13 adds explicit, non-destructive staging. Set `StageApproved` to `Yes` only after reviewing a candidate, then run:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -StageReplacementCandidates
+```
+
+Only `CandidateValidatedForReview` and `CandidateForcedDemuxerReview` are stage-eligible. The candidate is copied into the repair workspace under `staging/`, SHA-256 is checked before and after finalization, and the staged copy is strict-decoded again. `StagedVerified` still does not authorize replacement and the original library file is untouched.
 
 ## Failure-domain model
 
