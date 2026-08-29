@@ -7,6 +7,8 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 ## [Unreleased]
 
 ### Fixed
+- `-ReclassifyFailureDomains` now bypasses normal ffprobe/ffmpeg preflight checks because it only reads existing CSV measurements
+- Fixes silent pre-banner exit when running the report-only reclassification mode
 - Preserve combined error evidence instead of letting `AUDIO` override simultaneous `CONTAINER` or `ARTWORK` evidence
 - Combined domains now surface explicitly (`AUDIO+CONTAINER`, `AUDIO+ARTWORK`, `ARTWORK+CONTAINER`, or all three)
 - Combined-domain dispositions default conservatively to `ManualReview`
@@ -14,6 +16,16 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `-ReclassifyFailureDomains` mode that reuses existing full-classification measurements without re-decoding audio
+- Separate `PrimaryDomain` and `EvidenceDomain` fields
+- Primary domain is derived from the canonical signature and drives disposition
+- Evidence domain preserves every domain observed in FFmpeg diagnostics
+- `failure-classification-reclassified.csv` and summary report
+- `-ClassifyAuditFailures` full-library failure classification mode
+- Classifies every row from `audio-only-recheck.csv` using the validated canonical signature, error-domain, audio-completion, severity, and disposition model
+- `failure-classification.csv` with per-file results
+- `failure-classification-summary.csv` with counts by action, domain, severity, and canonical signature
+- Full classification remains read-only and does not change media or persistent repair state
 - Canonical FFmpeg error signatures that remove volatile decoder addresses
 - Independent error domains: `AUDIO`, `ARTWORK`, `CONTAINER`, `MIXED`, `UNKNOWN`
 - Domain-aware failure dispositions: `RepairArtwork`, `ContainerReview`, `AudioReview`, `ManualReview`, `ReplacementReview`

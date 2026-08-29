@@ -13,6 +13,8 @@ param(
     [switch]$AnalyzeAuditReports,
     [switch]$RecheckAuditFailures,
     [switch]$AnalyzeFailureSeverity,
+    [switch]$ClassifyAuditFailures,
+    [switch]$ReclassifyFailureDomains,
     [ValidateRange(1,50)]
     [int]$FailureSamplesPerSignature = 5
 )
@@ -20,7 +22,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.6.1"
+$ToolVersion = "0.7-dev.7.2"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -311,6 +313,27 @@ function Get-DecodeErrorDomain {
     if ($hasArtwork) { return "ARTWORK" }
     if ($hasContainer) { return "CONTAINER" }
     return "UNKNOWN"
+}
+
+
+function Get-PrimaryDomainFromSignature {
+    param([string]$Signature)
+
+    if ([string]::IsNullOrWhiteSpace($Signature)) {
+        return "UNKNOWN"
+    }
+
+    switch -Regex ($Signature) {
+        '^MP3 audio:'         { return "AUDIO" }
+        '^Audio:'             { return "AUDIO" }
+        '^PNG artwork:'       { return "ARTWORK" }
+        '^JPEG artwork:'      { return "ARTWORK" }
+        '^WebP artwork'       { return "ARTWORK" }
+        '^GIF artwork'        { return "ARTWORK" }
+        '^Container:'         { return "CONTAINER" }
+        '^Container/decoder:' { return "CONTAINER" }
+        default               { return "UNKNOWN" }
+    }
 }
 
 function Get-FailureDisposition {
@@ -798,6 +821,348 @@ function Invoke-TolerantAudioDecodeDiagnostic {
         ErrorText      = $errorText
         ErrorSignature = Get-DecodeErrorSignature $errorText
     }
+}
+
+
+
+function Invoke-ReclassifyFailureDomains {
+    param(
+        [Parameter(Mandatory)][string]$ClassificationReportPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $ClassificationReportPath -PathType Leaf)) {
+        throw "Existing failure classification report not found: $ClassificationReportPath`nRun -ClassifyAuditFailures first."
+    }
+
+    $rows = @(Import-Csv -LiteralPath $ClassificationReportPath)
+    if ($rows.Count -eq 0) {
+        Write-Host "Existing failure classification report is empty."
+        return
+    }
+
+    $outPath = Join-Path $OutputRoot "failure-classification-reclassified.csv"
+    $summaryPath = Join-Path $OutputRoot "failure-classification-reclassified-summary.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($row in $rows) {
+        $signature = [string]$row.Signature
+        $primaryDomain = Get-PrimaryDomainFromSignature $signature
+
+        $evidenceDomain = if ($row.PSObject.Properties.Name -contains "EvidenceDomain" -and $row.EvidenceDomain) {
+            [string]$row.EvidenceDomain
+        }
+        elseif ($row.PSObject.Properties.Name -contains "Domain" -and $row.Domain) {
+            [string]$row.Domain
+        }
+        else {
+            Get-DecodeErrorDomain ([string]$row.StrictError)
+        }
+
+        $reported = $null
+        if ($row.ReportedDurationSeconds -ne "") {
+            $tmpReported = 0.0
+            if ([double]::TryParse(
+                [string]$row.ReportedDurationSeconds,
+                [System.Globalization.NumberStyles]::Float,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$tmpReported
+            )) {
+                $reported = $tmpReported
+            }
+        }
+
+        $decoded = 0.0
+        $tmpDecoded = 0.0
+        if ([double]::TryParse(
+            [string]$row.DecodedDurationSeconds,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$tmpDecoded
+        )) {
+            $decoded = $tmpDecoded
+        }
+
+        $exitCode = 0
+        $tmpExit = 0
+        if ([int]::TryParse([string]$row.TolerantExitCode, [ref]$tmpExit)) {
+            $exitCode = $tmpExit
+        }
+
+        if ([string]$row.Severity -eq "MissingFile") {
+            $severity = "MissingFile"
+            $action = "LocateFile"
+        }
+        else {
+            $disp = Get-FailureDisposition `
+                -Domain $primaryDomain `
+                -ReportedSeconds $reported `
+                -DecodedSeconds $decoded `
+                -TolerantExitCode $exitCode
+            $severity = $disp.Severity
+            $action = $disp.Action
+        }
+
+        $results.Add([pscustomobject]@{
+            Path                    = $row.Path
+            Directory               = $row.Directory
+            FileName                = $row.FileName
+            Extension               = $row.Extension
+            Signature               = $signature
+            PrimaryDomain           = $primaryDomain
+            EvidenceDomain          = $evidenceDomain
+            Severity                = $severity
+            Action                  = $action
+            ReportedDurationSeconds = $row.ReportedDurationSeconds
+            DecodedDurationSeconds  = $row.DecodedDurationSeconds
+            DecodedPercent          = $row.DecodedPercent
+            TolerantExitCode        = $row.TolerantExitCode
+            TolerantErrorSignature  = $row.TolerantErrorSignature
+            TolerantError           = $row.TolerantError
+            StrictError             = $row.StrictError
+        })
+    }
+
+    $results |
+        Sort-Object Action, PrimaryDomain, Signature, Directory, FileName |
+        Export-Csv -LiteralPath $outPath -NoTypeInformation -Encoding UTF8
+
+    $summaryRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($category in @("Action","PrimaryDomain","EvidenceDomain","Severity","Signature")) {
+        foreach ($group in ($results | Group-Object $category | Sort-Object Count -Descending)) {
+            $summaryRows.Add([pscustomobject]@{
+                Category = $category
+                Name     = $group.Name
+                Count    = $group.Count
+            })
+        }
+    }
+
+    $summaryRows | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " FAILURE DOMAIN RECLASSIFICATION COMPLETE"
+    Write-Host ("=" * 72)
+
+    Write-Host ""
+    Write-Host "Recommended disposition:"
+    foreach ($group in ($results | Group-Object Action | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-26} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By primary domain:"
+    foreach ($group in ($results | Group-Object PrimaryDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By evidence domain:"
+    foreach ($group in ($results | Group-Object EvidenceDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $outPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "Existing decode measurements were reused; no audio was decoded again."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
+}
+
+function Invoke-FullFailureClassification {
+    param(
+        [Parameter(Mandatory)][string]$RecheckReportPath,
+        [Parameter(Mandatory)][string]$OutputRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $RecheckReportPath -PathType Leaf)) {
+        throw "Audio-only recheck report not found: $RecheckReportPath`nRun -RecheckAuditFailures first."
+    }
+
+    $rows = @(
+        Import-Csv -LiteralPath $RecheckReportPath |
+        Where-Object { $_.RecheckStatus -eq "SOURCE AUDIO ERROR" }
+    )
+
+    if ($rows.Count -eq 0) {
+        Write-Host "No SOURCE AUDIO ERROR rows exist in the recheck report."
+        return
+    }
+
+    $reportPath = Join-Path $OutputRoot "failure-classification.csv"
+    $summaryPath = Join-Path $OutputRoot "failure-classification-summary.csv"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    Write-Host "Failures to classify : $($rows.Count)"
+    Write-Host "This performs a tolerant audio decode of each failed file."
+    Write-Host ""
+
+    $i = 0
+    foreach ($row in $rows) {
+        $i++
+        $path = [string]$row.Path
+        $signature = Get-DecodeErrorSignature ([string]$row.RecheckError)
+        $evidenceDomain = Get-DecodeErrorDomain ([string]$row.RecheckError)
+        $primaryDomain = Get-PrimaryDomainFromSignature $signature
+
+        Write-Progress `
+            -Activity "Classifying audit failures" `
+            -Status "$i / $($rows.Count)" `
+            -PercentComplete (($i / [math]::Max($rows.Count,1)) * 100)
+
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $results.Add([pscustomobject]@{
+                Path                    = $path
+                Directory               = $row.Directory
+                FileName                = $row.FileName
+                Extension               = $row.Extension
+                Signature               = $signature
+                PrimaryDomain           = $primaryDomain
+                EvidenceDomain          = $evidenceDomain
+                Severity                = "MissingFile"
+                Action                  = "LocateFile"
+                ReportedDurationSeconds = $null
+                DecodedDurationSeconds  = $null
+                DecodedPercent          = $null
+                TolerantExitCode        = $null
+                TolerantErrorSignature  = $null
+                TolerantError           = "File no longer exists."
+                StrictError             = $row.RecheckError
+            })
+            continue
+        }
+
+        $reported = Get-ReportedAudioDurationSeconds -Path $path
+        $diag = Invoke-TolerantAudioDecodeDiagnostic -Path $path
+        $disposition = Get-FailureDisposition `
+            -Domain $primaryDomain `
+            -ReportedSeconds $reported `
+            -DecodedSeconds $diag.DecodedSeconds `
+            -TolerantExitCode $diag.ExitCode
+
+        $percent = $null
+        if ($null -ne $reported -and $reported -gt 0) {
+            $percent = [math]::Round(($diag.DecodedSeconds / [double]$reported) * 100, 2)
+        }
+
+        $results.Add([pscustomobject]@{
+            Path                    = $path
+            Directory               = $row.Directory
+            FileName                = $row.FileName
+            Extension               = if ($row.Extension) { $row.Extension } else { [System.IO.Path]::GetExtension($path) }
+            Signature               = $signature
+            PrimaryDomain           = $primaryDomain
+            EvidenceDomain          = $evidenceDomain
+            Severity                = $disposition.Severity
+            Action                  = $disposition.Action
+            ReportedDurationSeconds = $reported
+            DecodedDurationSeconds  = $diag.DecodedSeconds
+            DecodedPercent          = $percent
+            TolerantExitCode        = $diag.ExitCode
+            TolerantErrorSignature  = $diag.ErrorSignature
+            TolerantError           = $diag.ErrorText
+            StrictError             = $row.RecheckError
+        })
+    }
+
+    Write-Progress -Activity "Classifying audit failures" -Completed
+
+    $results |
+        Sort-Object Action, PrimaryDomain, Signature, Directory, FileName |
+        Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+    $summaryRows = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($group in ($results | Group-Object Action | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "Action"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object PrimaryDomain | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "PrimaryDomain"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object EvidenceDomain | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "EvidenceDomain"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object Severity | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "Severity"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    foreach ($group in ($results | Group-Object Signature | Sort-Object Count -Descending)) {
+        $summaryRows.Add([pscustomobject]@{
+            Category = "Signature"
+            Name     = $group.Name
+            Count    = $group.Count
+        })
+    }
+
+    $summaryRows |
+        Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("=" * 72)
+    Write-Host " FULL FAILURE CLASSIFICATION COMPLETE"
+    Write-Host ("=" * 72)
+
+    Write-Host ""
+    Write-Host "Recommended disposition:"
+    foreach ($group in ($results | Group-Object Action | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-26} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By primary domain:"
+    foreach ($group in ($results | Group-Object PrimaryDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By evidence domain:"
+    foreach ($group in ($results | Group-Object EvidenceDomain | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-24} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "By severity:"
+    foreach ($group in ($results | Group-Object Severity | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,-30} {1,6}" -f $group.Name,$group.Count)
+    }
+
+    Write-Host ""
+    Write-Host "Canonical signatures:"
+    foreach ($group in ($results | Group-Object Signature | Sort-Object Count -Descending)) {
+        Write-Host ("  {0,6}  {1}" -f $group.Count,$group.Name)
+    }
+
+    Write-Host ""
+    Write-Host "Reports:"
+    Write-Host "  $reportPath"
+    Write-Host "  $summaryPath"
+    Write-Host ""
+    Write-Host "Classification is diagnostic only; replacement state was not changed."
+    Write-Host "No media files were modified."
+    Write-Host "Persistent repair state was NOT modified."
 }
 
 function Invoke-FailureSeverityAnalysis {
@@ -2099,22 +2464,24 @@ $exclusiveModes = @(
         [bool]$AnalyzeAuditReports,
         [bool]$RecheckAuditFailures,
         [bool]$AnalyzeFailureSeverity,
+        [bool]$ClassifyAuditFailures,
+        [bool]$ReclassifyFailureDomains,
         [bool]$ApplyApproved
     ) | Where-Object { $_ }
 )
 
 if ($exclusiveModes.Count -gt 1) {
-    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, and -ApplyApproved are mutually exclusive modes."
+    throw "-AuditOnly, -AnalyzeAuditReports, -RecheckAuditFailures, -AnalyzeFailureSeverity, -ClassifyAuditFailures, -ReclassifyFailureDomains, and -ApplyApproved are mutually exclusive modes."
 }
 
-if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+if (-not $AnalyzeAuditReports -and -not $RecheckAuditFailures -and -not $AnalyzeFailureSeverity -and -not $ClassifyAuditFailures -and -not $ReclassifyFailureDomains -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
-if (($RecheckAuditFailures -or $AnalyzeFailureSeverity) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+if (($RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     throw "ffmpeg was not found in PATH."
 }
-if ($AnalyzeFailureSeverity -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+if (($AnalyzeFailureSeverity -or $ClassifyAuditFailures) -and -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
     throw "ffprobe was not found in PATH."
 }
 
@@ -2122,7 +2489,7 @@ New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
 # Audit/report-analysis output is intentionally isolated from persistent repair
 # state so whole-library analysis cannot overwrite an in-progress review.
-$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity) { Join-Path $StateRoot "audit" } else { $StateRoot }
+$ReportRoot = if ($AuditOnly -or $AnalyzeAuditReports -or $RecheckAuditFailures -or $AnalyzeFailureSeverity -or $ClassifyAuditFailures -or $ReclassifyFailureDomains) { Join-Path $StateRoot "audit" } else { $StateRoot }
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
 
 $StateFile = Join-Path $StateRoot "state.json"
@@ -2132,12 +2499,19 @@ $PlanReport = Join-Path $ReportRoot "rename-plan.csv"
 $ReplacementReport = Join-Path $ReportRoot "replacement-needed.csv"
 $DecodeReport = Join-Path $ReportRoot "source-decode-audit.csv"
 $AudioOnlyRecheckReport = Join-Path $ReportRoot "audio-only-recheck.csv"
+$FailureClassificationReport = Join-Path $ReportRoot "failure-classification.csv"
 
 Write-Host ""
 Write-Host "=== Music Library Repair v$ToolVersion ==="
 Write-Host "Root : $Root"
 $modeName = if ($ApplyApproved) {
     "APPLY APPROVED"
+}
+elseif ($ReclassifyFailureDomains) {
+    "RECLASSIFY FAILURE DOMAINS"
+}
+elseif ($ClassifyAuditFailures) {
+    "CLASSIFY ALL AUDIT FAILURES"
 }
 elseif ($AnalyzeFailureSeverity) {
     "ANALYZE FAILURE SEVERITY"
@@ -2156,6 +2530,20 @@ else {
 }
 Write-Host "Mode : $modeName"
 Write-Host ""
+
+if ($ReclassifyFailureDomains) {
+    Invoke-ReclassifyFailureDomains `
+        -ClassificationReportPath $FailureClassificationReport `
+        -OutputRoot $ReportRoot
+    return
+}
+
+if ($ClassifyAuditFailures) {
+    Invoke-FullFailureClassification `
+        -RecheckReportPath $AudioOnlyRecheckReport `
+        -OutputRoot $ReportRoot
+    return
+}
 
 if ($AnalyzeFailureSeverity) {
     Invoke-FailureSeverityAnalysis `

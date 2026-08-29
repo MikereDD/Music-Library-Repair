@@ -2,7 +2,7 @@
 
 **Typezer∅ Music Library Repair** is a safety-first Windows/PowerShell toolkit for auditing, normalizing, repairing, and verifying music libraries without re-encoding healthy audio.
 
-> Current development baseline: **v0.7-dev.6.1**
+> Current development baseline: **v0.7-dev.7.2**
 
 The project grew out of real-world cleanup work against large, inconsistent music libraries. Its core rule is simple:
 
@@ -228,3 +228,57 @@ Failure diagnostics now normalize volatile FFmpeg decoder addresses and classify
 Severity is based on actual audio completion plus the error domain. A malformed embedded PNG/JPEG that leaves audio complete is therefore an artwork-repair problem, not automatically a source-audio replacement.
 
 `-AnalyzeFailureSeverity` now reports conservative dispositions such as `RepairArtwork`, `ContainerReview`, `AudioReview`, `ManualReview`, and `ReplacementReview`.
+
+
+## v0.7-dev.7 full failure classification
+
+After validating the domain/severity model with sampling, classify every file currently present in `audit\audio-only-recheck.csv`:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -ClassifyAuditFailures
+```
+
+This does **not** rescan the full library and does not rerun the strict audit. It processes only the failures already identified by `-RecheckAuditFailures`, performs a tolerant audio decode for each one, then writes:
+
+- `audit\failure-classification.csv`
+- `audit\failure-classification-summary.csv`
+
+No media files or persistent repair state are modified.
+
+
+## v0.7-dev.7.1 primary vs evidence domain
+
+The classifier now distinguishes the **primary domain** implied by the canonical signature from all domains observed in FFmpeg stderr.
+
+Examples:
+
+```text
+Signature:      MP3 audio: header missing
+PrimaryDomain:  AUDIO
+EvidenceDomain: AUDIO+CONTAINER
+```
+
+```text
+Signature:      Container: invalid input data
+PrimaryDomain:  CONTAINER
+EvidenceDomain: AUDIO+CONTAINER
+```
+
+Disposition uses `PrimaryDomain + decoded completion`, while `EvidenceDomain` is retained for diagnostics.
+
+Reuse the existing full-classification measurements without decoding all failures again:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -ReclassifyFailureDomains
+```
+
+This writes `failure-classification-reclassified.csv` and `failure-classification-reclassified-summary.csv`.
+
+
+## v0.7-dev.7.2 preflight fix
+
+`-ReclassifyFailureDomains` is a report-only mode and now bypasses normal ffprobe/ffmpeg preflight checks. It should start immediately, print the banner, and reuse the existing classification CSV without touching media.

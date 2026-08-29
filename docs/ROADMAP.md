@@ -32,6 +32,10 @@ Next:
 - [x] separate audio, artwork, container, mixed, and unknown error domains
 - [x] domain-aware severity/disposition model
 - [x] preserve combined error-domain evidence without precedence loss
+- [x] classify all known strict-audit failures with the validated disposition model
+- [x] separate primary failure domain from secondary evidence domains
+- [x] reclassify existing full-audit measurements without repeat decoding
+- [x] make report-only reclassification independent of ffmpeg/ffprobe preflight
 - missing-track / track-number gap detector
 - disc-aware gap detection
 - authoritative MusicBrainz tracklist comparison
