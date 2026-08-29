@@ -34,6 +34,8 @@ replacement-staging-manifest.csv
 replacement-staging-summary.csv
 replacement-transaction-manifest.csv
 replacement-transaction-summary.csv
+replacement-postverify.csv
+replacement-postverify-summary.csv
 replacement-backups/
 staging/
 *-audit.csv

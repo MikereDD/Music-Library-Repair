@@ -80,6 +80,15 @@ Implemented in `v0.7-dev.14.1`:
 - ambiguous containers remain Unknown rather than guessed
 - quality relationship fields in transaction reporting
 
+Implemented in `v0.7-dev.15`:
+
+- read-only post-replacement transaction verification
+- automatic verification after successful replacement commits
+- current-state source/replacement/backup hash checks
+- forced-demuxer-aware strict decode verification
+- affected-album re-audit and status requalification
+- targeted queue-cleared assessment without rewriting historical audit reports
+
 Next:
 
 - exercise dev.11 candidate intake against known clean local replacement files

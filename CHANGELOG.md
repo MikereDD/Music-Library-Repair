@@ -21,6 +21,13 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- `-VerifyReplacementTransactions` read-only post-replacement verification mode
+- Automatic targeted post-verification after successful replacement commits
+- Current-state verification of source disposition, replacement existence, retained backup, SHA-256 hashes, and strict decode
+- Forced-demuxer-aware verification for replacements that require extension-specific probing/decoding
+- Affected-album rescan and requalification to `READY`, `NEEDS REVIEW`, `INCOMPLETE`, or `SOURCE ERROR`
+- `QueueStatus=ClearedByCurrentState` when the repaired item no longer requires source-error attention
+- `replacement-postverify.csv` and `replacement-postverify-summary.csv`
 - Dev.14.1 conservative source/replacement quality-class comparison
 - Explicit `QualityDowngradeApproved` intake gate for known lossless-to-lossy replacements
 - `QualityDowngrade`, `SameQualityClass`, `LosslessClassCandidate`, and `Unknown` relationship reporting

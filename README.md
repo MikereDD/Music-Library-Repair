@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.14.1-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.15-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.14.1**
+> Current development baseline: **v0.7-dev.15**
 
 ## Core workflow
 
@@ -263,6 +263,18 @@ Only `StagedVerified` items are eligible. Before commit, the current source is S
 Dev.14.1 adds a conservative quality-class gate before any replacement commit. The tool classifies only formats that are safe to infer from the extension: FLAC/WAV/AIFF/APE as lossless and MP3/AAC/Opus as lossy. Ambiguous containers such as M4A, OGG, WMA, and WV remain `Unknown` rather than being guessed.
 
 A known lossless-to-lossy replacement is reported as `QualityDowngrade` and is blocked unless the candidate intake row also has `QualityDowngradeApproved=Yes`. This approval is separate from `ReplaceApproved` so a structurally valid replacement cannot silently reduce the library's quality class.
+
+Dev.15 adds targeted post-replacement verification and album requalification. Successful replacement transactions are automatically checked again against the current filesystem, retained backup, SHA-256 hashes, and strict decode. The affected album folder is rescanned from disk and requalified with the same top-level statuses used by the main audit: `READY`, `NEEDS REVIEW`, `INCOMPLETE`, or `SOURCE ERROR`.
+
+Existing committed transactions can also be rechecked without touching media:
+
+```powershell
+.\src\Repair-MusicLibrary.ps1 `
+    -Root "P:\Music" `
+    -VerifyReplacementTransactions
+```
+
+`QueueStatus=ClearedByCurrentState` means the damaged source is gone when appropriate, the replacement exists, its current hash still matches the committed hash, and strict decode passes. This targeted verifier does not rewrite historical audit reports; a later full `-AuditOnly` remains the canonical whole-library snapshot.
 
 ## Failure-domain model
 
