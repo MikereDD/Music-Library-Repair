@@ -26,7 +26,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ToolVersion = "0.7-dev.11.1"
+$ToolVersion = "0.7-dev.12"
 $AudioExtensions = @(".mp3",".flac",".m4a",".aac",".ogg",".opus",".wav",".wma",".aiff",".aif",".ape",".wv",".m4b")
 $ArtworkExtensions = @(".jpg",".jpeg",".png",".webp")
 
@@ -861,6 +861,148 @@ function ConvertTo-IdentityKey {
     return $s.Trim()
 }
 
+
+function Get-ExpectedReplacementIdentity {
+    param(
+        [Parameter(Mandatory)]$Item
+    )
+
+    $sourcePath = [string]$Item.SourcePath
+    $leaf = [IO.Path]::GetFileNameWithoutExtension($sourcePath)
+    $dir = [IO.Path]::GetDirectoryName($sourcePath)
+    $parent = if ($dir) { Split-Path -Leaf $dir } else { $null }
+    $grandparentPath = if ($dir) { Split-Path -Parent $dir } else { $null }
+    $grandparent = if ($grandparentPath) { Split-Path -Leaf $grandparentPath } else { $null }
+
+    $artist = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Artist)) { [string]$Item.Artist } else { $null }
+    $album = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Album)) { [string]$Item.Album } else { $null }
+    $title = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Title)) { [string]$Item.Title } else { $null }
+    $track = $null
+    $disc = $null
+    $date = if (-not [string]::IsNullOrWhiteSpace([string]$Item.Date)) { [string]$Item.Date } else { $null }
+
+    $artistSource = if ($artist) { "SourceTag" } else { $null }
+    $albumSource = if ($album) { "SourceTag" } else { $null }
+    $titleSource = if ($title) { "SourceTag" } else { $null }
+    $trackSource = $null
+    $discSource = $null
+    $dateSource = if ($date) { "SourceTag" } else { $null }
+
+    $n = 0
+    if ([int]::TryParse([string]$Item.Track, [ref]$n)) {
+        $track = $n
+        $trackSource = "SourceTag"
+    }
+
+    $n = 0
+    if ([int]::TryParse([string]$Item.Disc, [ref]$n)) {
+        $disc = $n
+        $discSource = "SourceTag"
+    }
+
+    # Reconstruct track/title from common filename patterns only when missing.
+    if (-not $track -or -not $title) {
+        $m = [regex]::Match($leaf, '^(?<track>\d{1,3})\s*[-._ ]+\s*(?<title>.+)$')
+        if ($m.Success) {
+            if (-not $track) {
+                $track = [int]$m.Groups["track"].Value
+                $trackSource = "FileName"
+            }
+            if (-not $title) {
+                $title = $m.Groups["title"].Value.Trim()
+                $titleSource = "FileName"
+            }
+        }
+    }
+
+    # Canonical single-disc pattern: Track - Artist - Title
+    if (-not $artist -or -not $track -or -not $title) {
+        $m = [regex]::Match($leaf, '^(?<track>\d{1,3})\s*-\s*(?<artist>.+?)\s*-\s*(?<title>.+)$')
+        if ($m.Success) {
+            if (-not $track) {
+                $track = [int]$m.Groups["track"].Value
+                $trackSource = "FileName"
+            }
+            if (-not $artist) {
+                $artist = $m.Groups["artist"].Value.Trim()
+                $artistSource = "FileName"
+            }
+            if (-not $title) {
+                $title = $m.Groups["title"].Value.Trim()
+                $titleSource = "FileName"
+            }
+        }
+    }
+
+    # Canonical multi-disc pattern: Disc-Track - Artist - Title
+    if (-not $artist -or -not $disc -or -not $track -or -not $title) {
+        $m = [regex]::Match($leaf, '^(?<disc>\d{1,2})-(?<track>\d{1,3})\s*-\s*(?<artist>.+?)\s*-\s*(?<title>.+)$')
+        if ($m.Success) {
+            if (-not $disc) {
+                $disc = [int]$m.Groups["disc"].Value
+                $discSource = "FileName"
+            }
+            if (-not $track) {
+                $track = [int]$m.Groups["track"].Value
+                $trackSource = "FileName"
+            }
+            if (-not $artist) {
+                $artist = $m.Groups["artist"].Value.Trim()
+                $artistSource = "FileName"
+            }
+            if (-not $title) {
+                $title = $m.Groups["title"].Value.Trim()
+                $titleSource = "FileName"
+            }
+        }
+    }
+
+    # Infer album from the containing folder when source tags are missing.
+    if (-not $album -and $parent) {
+        $candidateAlbum = $parent
+        $candidateAlbum = $candidateAlbum -replace '^\s*[^-]+-\s*', ''
+        $candidateAlbum = $candidateAlbum -replace '\s*\((?:19|20)\d{2}\)\s*$', ''
+        $candidateAlbum = $candidateAlbum -replace '^\s*\[(?:19|20)\d{2}\]\s*', ''
+        if (-not [string]::IsNullOrWhiteSpace($candidateAlbum)) {
+            $album = $candidateAlbum.Trim()
+            $albumSource = "ParentFolder"
+        }
+    }
+
+    # Infer artist from common artist/album directory layout.
+    if (-not $artist -and $grandparent) {
+        $candidateArtist = $grandparent
+        if ($candidateArtist -notmatch '^(Music|Rock|Pop|HipHop|HipHop-Rap|Country-Folk|Electro|World|Indie|Blues-Jazz-Soul)$') {
+            $artist = $candidateArtist.Trim()
+            $artistSource = "GrandparentFolder"
+        }
+    }
+
+    # Pull a year from the album folder if source date is unavailable.
+    if (-not $date -and $parent) {
+        $m = [regex]::Match($parent, '(?<year>(?:19|20)\d{2})')
+        if ($m.Success) {
+            $date = $m.Groups["year"].Value
+            $dateSource = "ParentFolder"
+        }
+    }
+
+    [pscustomobject]@{
+        Artist       = $artist
+        ArtistSource = $artistSource
+        Album        = $album
+        AlbumSource  = $albumSource
+        Title        = $title
+        TitleSource  = $titleSource
+        Track        = $track
+        TrackSource  = $trackSource
+        Disc         = $disc
+        DiscSource   = $discSource
+        Date         = $date
+        DateSource   = $dateSource
+    }
+}
+
 function Invoke-ReviewReplacementCandidates {
     param(
         [Parameter(Mandatory)][string]$EvidenceAnalysisPath,
@@ -930,6 +1072,7 @@ function Invoke-ReviewReplacementCandidates {
     )
 
     foreach ($item in $withCandidate) {
+        $expectedIdentity = Get-ExpectedReplacementIdentity -Item $item
         $candidatePath = [Environment]::ExpandEnvironmentVariables([string]$item.CandidatePath)
         $candidatePath = $candidatePath.Trim()
 
@@ -1050,7 +1193,7 @@ function Invoke-ReviewReplacementCandidates {
                         else {
                             $durationStatus = "Readable"
 
-                            $expectedTitle = ConvertTo-IdentityKey ([string]$item.Title)
+                            $expectedTitle = ConvertTo-IdentityKey ([string]$expectedIdentity.Title)
                             $actualTitle = ConvertTo-IdentityKey ([string]$probe.Title)
                             if ($expectedTitle) {
                                 $identityMax += 4
@@ -1063,7 +1206,7 @@ function Invoke-ReviewReplacementCandidates {
                                 }
                             }
 
-                            $expectedArtist = ConvertTo-IdentityKey ([string]$item.Artist)
+                            $expectedArtist = ConvertTo-IdentityKey ([string]$expectedIdentity.Artist)
                             $actualArtist = ConvertTo-IdentityKey ([string]$probe.Artist)
                             if ($expectedArtist) {
                                 $identityMax += 3
@@ -1076,7 +1219,7 @@ function Invoke-ReviewReplacementCandidates {
                                 }
                             }
 
-                            $expectedAlbum = ConvertTo-IdentityKey ([string]$item.Album)
+                            $expectedAlbum = ConvertTo-IdentityKey ([string]$expectedIdentity.Album)
                             $actualAlbum = ConvertTo-IdentityKey ([string]$probe.Album)
                             if ($expectedAlbum) {
                                 $identityMax += 2
@@ -1091,7 +1234,7 @@ function Invoke-ReviewReplacementCandidates {
 
                             $expectedTrack = 0
                             $actualTrack = 0
-                            if ([int]::TryParse([string]$item.Track, [ref]$expectedTrack)) {
+                            if ([int]::TryParse([string]$expectedIdentity.Track, [ref]$expectedTrack)) {
                                 $identityMax += 1
                                 if ([int]::TryParse([string]$probe.Track, [ref]$actualTrack) -and $actualTrack -eq $expectedTrack) {
                                     $identityScore += 1
@@ -1104,7 +1247,7 @@ function Invoke-ReviewReplacementCandidates {
 
                             $expectedDisc = 0
                             $actualDisc = 0
-                            if ([int]::TryParse([string]$item.Disc, [ref]$expectedDisc)) {
+                            if ([int]::TryParse([string]$expectedIdentity.Disc, [ref]$expectedDisc)) {
                                 $identityMax += 1
                                 if ([int]::TryParse([string]$probe.Disc, [ref]$actualDisc) -and $actualDisc -eq $expectedDisc) {
                                     $identityScore += 1
@@ -1144,7 +1287,7 @@ function Invoke-ReviewReplacementCandidates {
         }
 
         if ($usedForcedDemuxer -and $forcedDecodeStatus -eq "Pass" -and $durationStatus -eq "ReadableForced") {
-            $expectedTitle = ConvertTo-IdentityKey ([string]$item.Title)
+            $expectedTitle = ConvertTo-IdentityKey ([string]$expectedIdentity.Title)
             $actualTitle = ConvertTo-IdentityKey ([string]$probe.Title)
             if ($expectedTitle) {
                 $identityMax += 4
@@ -1157,7 +1300,7 @@ function Invoke-ReviewReplacementCandidates {
                 }
             }
 
-            $expectedArtist = ConvertTo-IdentityKey ([string]$item.Artist)
+            $expectedArtist = ConvertTo-IdentityKey ([string]$expectedIdentity.Artist)
             $actualArtist = ConvertTo-IdentityKey ([string]$probe.Artist)
             if ($expectedArtist) {
                 $identityMax += 3
@@ -1170,7 +1313,7 @@ function Invoke-ReviewReplacementCandidates {
                 }
             }
 
-            $expectedAlbum = ConvertTo-IdentityKey ([string]$item.Album)
+            $expectedAlbum = ConvertTo-IdentityKey ([string]$expectedIdentity.Album)
             $actualAlbum = ConvertTo-IdentityKey ([string]$probe.Album)
             if ($expectedAlbum) {
                 $identityMax += 2
@@ -1185,7 +1328,7 @@ function Invoke-ReviewReplacementCandidates {
 
             $expectedTrack = 0
             $actualTrack = 0
-            if ([int]::TryParse([string]$item.Track, [ref]$expectedTrack)) {
+            if ([int]::TryParse([string]$expectedIdentity.Track, [ref]$expectedTrack)) {
                 $identityMax += 1
                 if ([int]::TryParse([string]$probe.Track, [ref]$actualTrack) -and $actualTrack -eq $expectedTrack) {
                     $identityScore += 1
@@ -1198,7 +1341,7 @@ function Invoke-ReviewReplacementCandidates {
 
             $expectedDisc = 0
             $actualDisc = 0
-            if ([int]::TryParse([string]$item.Disc, [ref]$expectedDisc)) {
+            if ([int]::TryParse([string]$expectedIdentity.Disc, [ref]$expectedDisc)) {
                 $identityMax += 1
                 if ([int]::TryParse([string]$probe.Disc, [ref]$actualDisc) -and $actualDisc -eq $expectedDisc) {
                     $identityScore += 1
@@ -1240,21 +1383,29 @@ function Invoke-ReviewReplacementCandidates {
             IdentityScore            = $identityScore
             IdentityMax              = $identityMax
             IdentityConflicts        = ($identityConflicts -join ",")
-            ExpectedArtist           = $item.Artist
+            IdentityBasis           = (@($expectedIdentity.ArtistSource,$expectedIdentity.AlbumSource,$expectedIdentity.TrackSource,$expectedIdentity.TitleSource,$expectedIdentity.DiscSource,$expectedIdentity.DateSource) | Where-Object { $_ } | Select-Object -Unique) -join ","
+            ExpectedArtist           = $expectedIdentity.Artist
+            ExpectedArtistSource     = $expectedIdentity.ArtistSource
             CandidateArtist          = $candidateArtist
             ArtistMatch              = $artistMatch
-            ExpectedAlbum            = $item.Album
+            ExpectedAlbum            = $expectedIdentity.Album
+            ExpectedAlbumSource      = $expectedIdentity.AlbumSource
             CandidateAlbum           = $candidateAlbum
             AlbumMatch               = $albumMatch
-            ExpectedDisc             = $item.Disc
+            ExpectedDisc             = $expectedIdentity.Disc
+            ExpectedDiscSource       = $expectedIdentity.DiscSource
             CandidateDisc            = $candidateDisc
             DiscMatch                = $discMatch
-            ExpectedTrack            = $item.Track
+            ExpectedTrack            = $expectedIdentity.Track
+            ExpectedTrackSource      = $expectedIdentity.TrackSource
             CandidateTrack           = $candidateTrack
             TrackMatch               = $trackMatch
-            ExpectedTitle            = $item.Title
+            ExpectedTitle            = $expectedIdentity.Title
+            ExpectedTitleSource      = $expectedIdentity.TitleSource
             CandidateTitle           = $candidateTitle
             TitleMatch               = $titleMatch
+            ExpectedDate             = $expectedIdentity.Date
+            ExpectedDateSource       = $expectedIdentity.DateSource
             StrictError              = $strictError
         })
     }

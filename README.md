@@ -13,7 +13,7 @@
   <a href="LICENSE.md"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4.svg">
   <img alt="PowerShell 7+" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg">
-  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.11.1-orange.svg">
+  <img alt="Development baseline" src="https://img.shields.io/badge/version-v0.7--dev.12-orange.svg">
   <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-yellow.svg">
 </p>
 
@@ -34,7 +34,7 @@
 
 The tool is built for real-world libraries where malformed tags, damaged frames, truncated titles, bad embedded artwork, ambiguous releases, inconsistent filenames, and genuinely corrupt source files can all exist side-by-side.
 
-> Current development baseline: **v0.7-dev.11.1**
+> Current development baseline: **v0.7-dev.12**
 
 ## Core workflow
 
@@ -235,6 +235,8 @@ Candidate validation checks that the file exists, is a supported audio format, i
 `CandidateValidatedForReview` is deliberately not an approval state. It means the candidate is structurally clean and identity-plausible enough for human review; staging and replacement remain disabled.
 
 If normal probing fails for a `.mp3`, dev.11.1 performs a conservative MP3-demuxer fallback. A candidate that passes forced MP3 probe and forced strict decode is labeled `CandidateForcedDemuxerReview`, never silently promoted to normal validation. The report preserves the normal-probe failure and the forced-probe/decode evidence.
+
+Dev.12 reconstructs expected identity when damaged source tags are missing. It prefers source tags, then cautiously derives track/title/artist/disc from recognized filename patterns and album/artist/year from the directory layout. Validation reports record the provenance for each expected field (`SourceTag`, `FileName`, `ParentFolder`, or `GrandparentFolder`) so inferred identity is never presented as authoritative metadata.
 
 ## Failure-domain model
 

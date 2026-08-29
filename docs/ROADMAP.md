@@ -44,6 +44,15 @@ Implemented in `v0.7-dev.11`:
 - validated-for-review status without staging or replacement authority
 - dev.11.1 conservative forced-MP3 demuxer fallback with explicit review-only status when automatic probing misdetects a candidate
 
+Implemented in `v0.7-dev.12`:
+
+- expected-identity reconstruction when source tags are missing
+- provenance for inferred identity fields
+- filename-based track/title/artist/disc recovery
+- parent-folder album/year inference
+- grandparent-folder artist inference
+- candidate comparison against reconstructed identity without granting replacement authority
+
 Next:
 
 - exercise dev.11 candidate intake against known clean local replacement files

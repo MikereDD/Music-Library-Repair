@@ -21,6 +21,11 @@ The project is still pre-1.0. Behavior and state formats may evolve while the sa
 - Corrected `-RecheckAuditFailures` mode dispatch; v0.7-dev.4 accidentally inserted the recheck call inside the mode-label expression, causing the command to return immediately instead of running the targeted audit.
 
 ### Added
+- Dev.12 expected-identity reconstruction for replacement candidates when damaged source tags are missing
+- Provenance-aware identity fields using `SourceTag`, `FileName`, `ParentFolder`, and `GrandparentFolder`
+- Conservative parsing for common track/title, canonical single-disc, and canonical multi-disc filenames
+- Album/year inference from the containing album folder and artist inference from the surrounding directory layout
+- Candidate validation report fields for expected identity provenance and combined `IdentityBasis`
 - `-ReviewReplacementCandidates` non-destructive candidate-intake and validation mode
 - `replacement-candidate-intake.csv` for assigning local candidate paths to high-confidence `UnreadableMediaSource` items
 - Candidate intake preserves assigned paths and review notes across reruns
